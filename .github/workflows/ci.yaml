@@ -36,7 +36,7 @@ jobs:
           rustup set profile minimal
           rustup toolchain install stable --component rust-docs --no-self-update
           rustup toolchain install nightly --component miri --no-self-update
-          rustup toolchain install nightly-2023-05-27 --component rust-src,rustc-dev,llvm-tools-preview --no-self-update
+          rustup toolchain install nightly-2025-06-30 --component rust-src,rustc-dev,llvm-tools --no-self-update
       - name: build
         run: cargo build --workspace --features serde --all-targets -v
       - name: test
@@ -89,7 +89,7 @@ jobs:
         run: |
           rustup set profile minimal
           rustup toolchain install stable nightly --no-self-update
-          rustup toolchain install nightly-2023-05-27 --component rust-src,rustc-dev,llvm-tools-preview --no-self-update
+          rustup toolchain install nightly-2025-06-30 --component rust-src,rustc-dev,llvm-tools --no-self-update
       - if: ${{ runner.os == 'Linux' }}
         name: Linux - Install native dependencies and spirv-tools
         run: |
@@ -118,9 +118,9 @@ jobs:
       # end install spirv-tools
       - uses: actions/checkout@v4
       - name: check krnlc
-        run: cargo +nightly-2023-05-27 -Zunstable-options -C=krnlc check --locked --no-default-features --features use-installed-tools -vv
+        run: cargo +nightly-2025-06-30 -Zunstable-options -C=krnlc check --locked --no-default-features --features use-installed-tools -vv
       - name: install krnlc
-        run: cargo +nightly-2023-05-27 install --path krnlc --root . --locked --no-default-features --features use-installed-tools -vv --debug
+        run: cargo +nightly-2025-06-30 install --path krnlc --root . --locked --no-default-features --features use-installed-tools -vv --debug
       - name: krnlc check
         run: ./bin/krnlc --check -p krnl -p krnlc-tests -p compute-benchmarks -v
   lint:
@@ -133,11 +133,11 @@ jobs:
           rustup set profile minimal
           rustup toolchain install stable --component rustfmt,clippy,rust-docs --no-self-update
           rustup toolchain install nightly 1.70.0 --no-self-update
-          rustup toolchain install nightly-2023-05-27 --component rustfmt,clippy,rust-src,rustc-dev,llvm-tools-preview --no-self-update
+          rustup toolchain install nightly-2025-06-30 --component rustfmt,clippy,rust-src,rustc-dev,llvm-tools --no-self-update
       - name: fmt
         run: cargo fmt --check
       - name: krnlc fmt
-        run: cargo +nightly-2023-05-27 fmt --check --manifest-path krnlc/Cargo.toml
+        run: cargo +nightly-2025-06-30 fmt --check --manifest-path krnlc/Cargo.toml
       - name: install cargo-hack
         run: cargo install cargo-hack
       - name: clippy
@@ -145,7 +145,7 @@ jobs:
           CARGO_ALIAS_CLIPPYALL: clippy --workspace
         run: cargo hack --feature-powerset --skip default clippyall --all-targets -v -- -D warnings -A unexpected_cfgs
       - name: krnlc clippy
-        run: cargo +nightly-2023-05-27 clippy --manifest-path krnlc/Cargo.toml --no-default-features --features use-installed-tools -v -- -D warnings
+        run: cargo +nightly-2025-06-30 clippy --manifest-path krnlc/Cargo.toml --no-default-features --features use-installed-tools -v -- -D warnings
       - name: rustdoc
         run: |
           cargo hack -p krnl -p krnl-macros -p krnl-core --feature-powerset --skip default rustdoc -v -- --D warnings

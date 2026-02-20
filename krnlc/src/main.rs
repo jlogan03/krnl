@@ -8,7 +8,7 @@ use fxhash::{FxHashMap, FxHashSet};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use spirv_builder::{MetadataPrintout, ShaderPanicStrategy, SpirvBuilder, SpirvMetadata};
+use spirv_builder::{ShaderPanicStrategy, SpirvBuilder, SpirvMetadata};
 use std::{
     fmt::{self, Debug},
     path::{Path, PathBuf},
@@ -531,7 +531,7 @@ fn compile(
             lib_dir.join(&rustc_codegen_spirv_lib),
             librustc_codegen_spirv.as_ref(),
         )?;
-        // https://github.com/EmbarkStudios/rust-gpu/blob/main/crates/spirv-builder/src/lib.rs
+        // https://github.com/Rust-GPU/rust-gpu/blob/main/crates/spirv-builder/src/lib.rs
         fn dylib_path_envvar() -> &'static str {
             if cfg!(windows) {
                 "PATH"
@@ -625,9 +625,9 @@ crate-type = ["dylib"]
     if dump_kernels {
         std::fs::create_dir_all(&kernels_dir)?;
     }
-    let mut builder = SpirvBuilder::new(&device_crate_dir, "spirv-unknown-vulkan1.2")
-        .spirv_metadata(SpirvMetadata::NameVariables)
-        .print_metadata(MetadataPrintout::None);
+    let mut builder =
+        SpirvBuilder::new(&device_crate_dir, "spirv-unknown-vulkan1.2")
+            .spirv_metadata(SpirvMetadata::NameVariables);
     if debug_printf {
         builder = builder
             .extension("SPV_KHR_non_semantic_info")
@@ -841,7 +841,7 @@ fn kernel_post_process(
             for inst in spirv_module.annotations.iter() {
                 let op = inst.class.opcode;
                 if op == Op::Decorate {
-                    if let [Operand::IdRef(id), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralInt32(1)] =
+                    if let [Operand::IdRef(id), Operand::Decoration(Decoration::DescriptorSet), Operand::LiteralBit32(1)] =
                         inst.operands.as_slice()
                     {
                         kernel_data_var.replace(*id);
@@ -871,7 +871,7 @@ fn kernel_post_process(
                 if let Some(result_id) = inst.result_id {
                     let op = inst.class.opcode;
                     let operands = inst.operands.as_slice();
-                    if let (Op::Constant, [Operand::LiteralInt32(value)]) = (op, operands) {
+                    if let (Op::Constant, [Operand::LiteralBit32(value)]) = (op, operands) {
                         constants.insert(result_id, *value);
                     }
                 }
@@ -941,7 +941,7 @@ fn kernel_post_process(
                         let op = inst.class.opcode;
                         let operands = inst.operands.as_slice();
                         match (op, operands) {
-                            (Op::Constant, [Operand::LiteralInt32(value)]) => {
+                            (Op::Constant, [Operand::LiteralBit32(value)]) => {
                                 constants.insert(result_id, *value);
                             }
                             (Op::TypeArray, [Operand::IdRef(ty), Operand::IdRef(_)]) => {
@@ -1068,13 +1068,13 @@ fn kernel_post_process(
         {
             let mut builder = rspirv::dr::Builder::new_from_module(std::mem::take(&mut spirv_module));
             let uint = builder.type_int(32, 0);
-            let one = builder.constant_u32(uint, 1);
-            let threads = builder.spec_constant_u32(uint, 1);
+            let one = builder.constant_bit32(uint, 1);
+            let threads = builder.spec_constant_bit32(uint, 1);
             let spec_id = kernel_desc.spec_descs.len() as u32;
             builder.decorate(
                 threads,
                 Decoration::SpecId,
-                [Operand::LiteralInt32(spec_id)],
+                [Operand::LiteralBit32(spec_id)],
             );
             let uvec3 = builder.type_vector(uint, 3);
             let workgroup_size = builder.spec_constant_composite(uvec3, [threads, one, one]);
@@ -1110,20 +1110,20 @@ fn kernel_post_process(
         }
         for inst in spirv_module.types_global_values.iter() {
             match (inst.class.opcode, inst.operands.first()) {
-                (Op::TypeInt, Some(Operand::LiteralInt32(8))) => {
+                (Op::TypeInt, Some(Operand::LiteralBit32(8))) => {
                     features |= Features::INT8;
                 }
-                (Op::TypeInt, Some(Operand::LiteralInt32(16))) => {
+                (Op::TypeInt, Some(Operand::LiteralBit32(16))) => {
                     features |= Features::INT16;
                 }
-                (Op::TypeInt | Op::TypeFloat, Some(Operand::LiteralInt32(32))) => (),
-                (Op::TypeInt, Some(Operand::LiteralInt32(64))) => {
+                (Op::TypeInt | Op::TypeFloat, Some(Operand::LiteralBit32(32))) => (),
+                (Op::TypeInt, Some(Operand::LiteralBit32(64))) => {
                     features |= Features::INT64;
                 }
-                (Op::TypeFloat, Some(Operand::LiteralInt32(16))) => {
+                (Op::TypeFloat, Some(Operand::LiteralBit32(16))) => {
                     features |= Features::FLOAT16;
                 }
-                (Op::TypeFloat, Some(Operand::LiteralInt32(64))) => {
+                (Op::TypeFloat, Some(Operand::LiteralBit32(64))) => {
                     features |= Features::FLOAT64;
                 }
                 (Op::TypeInt | Op::TypeFloat, _) => unreachable!(),
@@ -1383,7 +1383,7 @@ fn add_spec_constant_ops(module: &mut rspirv::dr::Module) {
                                             Op::SpecConstantOp,
                                             inst.result_type,
                                             inst.result_id,
-                                            [Operand::LiteralInt32(inst.class.opcode as u32)]
+                                            [Operand::LiteralBit32(inst.class.opcode as u32)]
                                                 .into_iter()
                                                 .chain(inst.operands.clone())
                                                 .collect(),

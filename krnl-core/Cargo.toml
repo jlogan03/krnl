@@ -18,7 +18,7 @@ autobenches = false
 
 [dependencies]
 krnl-macros.workspace = true
-spirv-std = "=0.9.0"
+spirv-std = { git = "https://github.com/Rust-GPU/rust-gpu.git", rev = "8eecf61e0f3a0d9a822206673dab092985fe398b" }
 paste.workspace = true
 dry.workspace = true
 
@@ -39,7 +39,7 @@ num-traits = { workspace = true, default-features = false, features = ["libm"] }
 half = { version = ">=2.1.0,<=2.4.0", default-features = false, features = [
     "num-traits",
 ] }
-glam = { version = ">=0.24,<=0.24.2", default-features = false, features = [
+glam = { version = ">=0.30.8", default-features = false, features = [
     "libm",
 ] }
 libm = ">=0.2.0,<=0.2.11"

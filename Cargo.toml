@@ -29,7 +29,7 @@ half = { version = "2.1.0", default-features = false, features = [
 num-traits = { version = "0.2.14", default-features = false }
 thiserror = "1.0.31"
 bincode2 = "2.0.1"
-rspirv = "0.11.0"
+rspirv = "0.12"
 flate2 = "1.0.25"
 hex = "0.4.3"
 rustversion = "1.0.12"

@@ -8,11 +8,11 @@ use std::{
     process::Command,
 };
 
-#[rustversion::not(nightly(2023-05-26))]
+#[rustversion::not(nightly(2025-06-29))]
 compile_error!(
-    "krnlc requires nightly-2023-05-27, install with rustup:
-rustup toolchain install nightly-2023-05-27
-rustup component add --toolchain nightly-2023-05-27 rust-src rustc-dev llvm-tools-preview"
+    "krnlc requires nightly-2025-06-30, install with rustup:
+rustup toolchain install nightly-2025-06-30
+rustup component add --toolchain nightly-2025-06-30 rust-src rustc-dev llvm-tools"
 );
 
 fn main() {

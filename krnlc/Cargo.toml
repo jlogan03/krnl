@@ -26,12 +26,12 @@ clap-cargo = { version = "0.13.0", features = ["cargo_metadata"] }
 anyhow = "1.0.60"
 syn = { version = "1.0.103", features = ["full", "visit", "extra-traits"] }
 cargo_metadata = "0.18.1"
-spirv-builder = { version = "=0.9.0", default-features = false }
+spirv-builder = { git = "https://github.com/Rust-GPU/rust-gpu.git", rev = "8eecf61e0f3a0d9a822206673dab092985fe398b", default-features = false }
 serde = { version = "1.0.143", default-features = false, features = ["derive"] }
 bincode2 = "2.0.1"
 symlink = "0.1.0"
-rspirv = "0.11.0"
-spirv-tools = { version = "0.9.0", default-features = false }
+rspirv = "0.12"
+spirv-tools = { version = "0.13", default-features = false }
 itertools = "0.10.5"
 rayon = "1.7.0"
 flate2 = "1.0.25"
@@ -52,5 +52,9 @@ use-compiled-tools = [
 ]
 use-installed-tools = [
     "spirv-builder/use-installed-tools",
-    "spirv-builder/use-installed-tools",
+    "spirv-tools/use-installed-tools",
 ]
+
+[patch.crates-io]
+rustc_codegen_spirv = { git = "https://github.com/Rust-GPU/rust-gpu.git", rev = "8eecf61e0f3a0d9a822206673dab092985fe398b" }
+rustc_codegen_spirv-types = { git = "https://github.com/Rust-GPU/rust-gpu.git", rev = "8eecf61e0f3a0d9a822206673dab092985fe398b" }

@@ -15,7 +15,7 @@ Developed for [autograph](https://docs.rs/autograph).
 Kernel compiler for krnl.
 - Built on [spirv-builder](https://docs.rs/spirv-builder).
 - Supports dependencies defined in Cargo.toml.
-- Uses [spirv-tools](https://docs.rs/spirv-tools-rs) to validate and optimize.
+- Uses [spirv-tools](https://docs.rs/spirv-tools) to validate and optimize.
 - Compiles to "krnl-cache.rs", so the crate will build on stable Rust.
 
 See [kernel](kernel#krnlc) for installation and usage instructions.
