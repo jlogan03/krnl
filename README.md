@@ -32,6 +32,19 @@ See the docs for installation and usage instructions.
 
 # Installing
 
+The host library requires Rust 1.95 or newer. The kernel compiler uses
+`nightly-2026-05-22`, matching rust-gpu revision `7fa56ad6e8`.
+From this checkout, install it with:
+
+```sh
+rustup toolchain install nightly-2026-05-22 --profile minimal --component rust-src,rustc-dev,llvm-tools
+cargo +nightly-2026-05-22 install --path krnlc --locked
+```
+
+The default build compiles SPIRV-Tools 0.13.3 from source (a C++ compiler is
+required). `--no-default-features --features use-installed-tools` instead uses
+SPIRV-Tools from `PATH`.
+
 For device functionality (kernels), install [Vulkan](https://www.vulkan.org) for your platform.
 
 - For development, it's recomended to install the [LunarG Vulkan SDK](https://www.lunarg.com/vulkan-sdk/), which includes additional tools:

@@ -8,14 +8,20 @@ use std::{
     process::Command,
 };
 
-#[rustversion::not(nightly(2025-06-29))]
+#[rustversion::not(nightly(2026-05-21))]
 compile_error!(
-    "krnlc requires nightly-2025-06-30, install with rustup:
-rustup toolchain install nightly-2025-06-30
-rustup component add --toolchain nightly-2025-06-30 rust-src rustc-dev llvm-tools"
+    "krnlc requires nightly-2026-05-22, install with rustup:
+rustup toolchain install nightly-2026-05-22
+rustup component add --toolchain nightly-2026-05-22 rust-src rustc-dev llvm-tools"
 );
 
 fn main() {
+    let toolchain = include_str!("rust-toolchain.toml")
+        .lines()
+        .find_map(|line| line.strip_prefix("channel = "))
+        .unwrap()
+        .trim_matches('"');
+    println!("cargo:rustc-env=KRNLC_TOOLCHAIN={toolchain}");
     let output = Command::new(var("RUSTC").unwrap())
         .args(["--print", "sysroot"])
         .output()

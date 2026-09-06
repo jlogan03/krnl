@@ -89,11 +89,8 @@ fn cargo_expand(
     krnlc_metadata: &KrnlcMetadata,
     verbose: bool,
 ) -> Result<FxHashMap<String, String>> {
-    use std::env::var;
     let mut command = Command::new("cargo");
-    if let Ok("stable" | "beta") | Err(_) = var("RUSTUP_TOOLCHAIN").as_deref() {
-        command.arg("+nightly");
-    }
+    command.arg(concat!("+", env!("KRNLC_TOOLCHAIN")));
     command.args([
         "rustc",
         "--manifest-path",
@@ -570,6 +567,7 @@ verbose = {verbose}
         );
         std::fs::write(config_dir.join("config.toml"), config.as_bytes())?;
         let build_script = r#"fn main() {
+            println!("cargo:rustc-check-cfg=cfg(krnlc)");
             println!("cargo:rustc-cfg=krnlc");
         }
                 "#;
@@ -610,6 +608,7 @@ crate-type = ["dylib"]
     }
     if update {
         let status = Command::new("cargo")
+            .arg(concat!("+", env!("KRNLC_TOOLCHAIN")))
             .args([
                 "update",
                 "--manifest-path",
@@ -625,9 +624,9 @@ crate-type = ["dylib"]
     if dump_kernels {
         std::fs::create_dir_all(&kernels_dir)?;
     }
-    let mut builder =
-        SpirvBuilder::new(&device_crate_dir, "spirv-unknown-vulkan1.2")
-            .spirv_metadata(SpirvMetadata::NameVariables);
+    let mut builder = SpirvBuilder::new(&device_crate_dir, "spirv-unknown-vulkan1.2")
+        .spirv_metadata(SpirvMetadata::NameVariables);
+    builder.toolchain_overwrite = Some(env!("KRNLC_TOOLCHAIN").to_string());
     if debug_printf {
         builder = builder
             .extension("SPV_KHR_non_semantic_info")

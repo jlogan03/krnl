@@ -36,7 +36,7 @@ jobs:
           rustup set profile minimal
           rustup toolchain install stable --component rust-docs --no-self-update
           rustup toolchain install nightly --component miri --no-self-update
-          rustup toolchain install nightly-2025-06-30 --component rust-src,rustc-dev,llvm-tools --no-self-update
+          rustup toolchain install nightly-2026-05-22 --component rust-src,rustc-dev,llvm-tools --no-self-update
       - name: build
         run: cargo build --workspace --features serde --all-targets -v
       - name: test
@@ -62,16 +62,7 @@ jobs:
         continue-on-error: ${{ runner.os == 'macOS' }}
   krnlc:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    env:
-      # spirv tools install copied from https://github.com/EmbarkStudios/rust-gpu/blob/main/.github/workflows/ci.yaml
-      spirv_tools_version: "20221024"
-      # NOTE(eddyb) do not forget to update both the above date and below links!
-      # FIXME(eddyb) automate this somewhat by taking advantage of the bucket APIs,
-      # and look for the first build with the date in `spirv_tools_version`.
-      spirv_tools_linux_url: "https://storage.googleapis.com/spirv-tools/artifacts/prod/graphics_shader_compiler/spirv-tools/linux-clang-release/continuous/1863/20221024-094528/install.tgz"
-      spirv_tools_macos_url: "https://storage.googleapis.com/spirv-tools/artifacts/prod/graphics_shader_compiler/spirv-tools/macos-clang-release/continuous/1875/20221024-094531/install.tgz"
-      spirv_tools_windows_url: "https://storage.googleapis.com/spirv-tools/artifacts/prod/graphics_shader_compiler/spirv-tools/windows-msvc-2017-release/continuous/1851/20221024-094908/install.zip"
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -82,62 +73,35 @@ jobs:
           #   target: x86_64-pc-windows-msvc
           - os: macos-latest
             target: x86_64-apple-darwin
-    # spirv tools install copied from https://github.com/EmbarkStudios/rust-gpu/blob/main/.github/workflows/ci.yaml
     steps:
       - uses: actions/checkout@v4
       - name: install toolchains
         run: |
           rustup set profile minimal
           rustup toolchain install stable nightly --no-self-update
-          rustup toolchain install nightly-2025-06-30 --component rust-src,rustc-dev,llvm-tools --no-self-update
-      - if: ${{ runner.os == 'Linux' }}
-        name: Linux - Install native dependencies and spirv-tools
-        run: |
-          sudo apt install libwayland-cursor0 libxkbcommon-dev libwayland-dev
-          mkdir "${HOME}/spirv-tools"
-          curl -fL "$spirv_tools_linux_url" | tar -xz -C "${HOME}/spirv-tools"
-          echo "${HOME}/spirv-tools/install/bin" >> $GITHUB_PATH
-      - if: ${{ runner.os == 'macOS' }}
-        name: Mac - Install spirv-tools
-        # FIXME(eddyb) deduplicate with Linux (and maybe even Windows?).
-        run: |
-          mkdir "${HOME}/spirv-tools"
-          curl -fL "$spirv_tools_macos_url" | tar -xz -C "${HOME}/spirv-tools"
-          echo "${HOME}/spirv-tools/install/bin" >> $GITHUB_PATH
-      - if: ${{ runner.os == 'Windows' }}
-        name: Windows - Install spirv-tools
-        shell: bash
-        run: |
-          tmparch=$(mktemp)
-          mkdir "${HOME}/spirv-tools"
-          curl -fL -o "$tmparch" "$spirv_tools_windows_url"
-          unzip "$tmparch" -d "${HOME}/spirv-tools"
-      - if: ${{ runner.os == 'Windows' }}
-        # Runs separately to add spir-v tools to Powershell's Path.
-        run: echo "$HOME/spirv-tools/install/bin" >> $env:GITHUB_PATH
-      # end install spirv-tools
+          rustup toolchain install nightly-2026-05-22 --component rust-src,rustc-dev,llvm-tools --no-self-update
       - uses: actions/checkout@v4
       - name: check krnlc
-        run: cargo +nightly-2025-06-30 -Zunstable-options -C=krnlc check --locked --no-default-features --features use-installed-tools -vv
+        run: cargo +nightly-2026-05-22 -Zunstable-options -C=krnlc check --locked -vv
       - name: install krnlc
-        run: cargo +nightly-2025-06-30 install --path krnlc --root . --locked --no-default-features --features use-installed-tools -vv --debug
+        run: cargo +nightly-2026-05-22 install --path krnlc --root . --locked -vv --debug
       - name: krnlc check
-        run: ./bin/krnlc --check -p krnl -p krnlc-tests -p compute-benchmarks -v
+        run: ./bin/krnlc --check -p krnl -p krnlc-tests -p compute-benches -v
   lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: install toolchains
         run: |
           rustup set profile minimal
           rustup toolchain install stable --component rustfmt,clippy,rust-docs --no-self-update
-          rustup toolchain install nightly 1.70.0 --no-self-update
-          rustup toolchain install nightly-2025-06-30 --component rustfmt,clippy,rust-src,rustc-dev,llvm-tools --no-self-update
+          rustup toolchain install nightly 1.95.0 --no-self-update
+          rustup toolchain install nightly-2026-05-22 --component rustfmt,clippy,rust-src,rustc-dev,llvm-tools --no-self-update
       - name: fmt
         run: cargo fmt --check
       - name: krnlc fmt
-        run: cargo +nightly-2025-06-30 fmt --check --manifest-path krnlc/Cargo.toml
+        run: cargo +nightly-2026-05-22 fmt --check --manifest-path krnlc/Cargo.toml
       - name: install cargo-hack
         run: cargo install cargo-hack
       - name: clippy
@@ -145,7 +109,7 @@ jobs:
           CARGO_ALIAS_CLIPPYALL: clippy --workspace
         run: cargo hack --feature-powerset --skip default clippyall --all-targets -v -- -D warnings -A unexpected_cfgs
       - name: krnlc clippy
-        run: cargo +nightly-2025-06-30 clippy --manifest-path krnlc/Cargo.toml --no-default-features --features use-installed-tools -v -- -D warnings
+        run: cargo +nightly-2026-05-22 clippy --manifest-path krnlc/Cargo.toml -v -- -D warnings
       - name: rustdoc
         run: |
           cargo hack -p krnl -p krnl-macros -p krnl-core --feature-powerset --skip default rustdoc -v -- --D warnings
@@ -154,9 +118,9 @@ jobs:
         env:
           CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
         run: |
-          cargo +nightly generate-lockfile -Zmsrv-policy
+          cargo generate-lockfile
           cat Cargo.lock
-          cargo +1.70.0 check --workspace --features serde --all-targets -v
+          cargo +1.95.0 check --workspace --features serde --all-targets -v
   deny:
     runs-on: ubuntu-latest
     timeout-minutes: 5

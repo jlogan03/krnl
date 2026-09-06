@@ -100,25 +100,22 @@ If the version of krnlc is incompatible with the krnl version, [`module`](#modul
 will emit a compiler error.
 
 ## Toolchains
-To locate [modules](#modules), krnlc will use the nightly toolchain. Install it with:
+To locate [modules](#modules) and compile kernels with
+[spirv-builder](https://docs.rs/crate/spirv-builder), krnlc uses its pinned nightly:
 ```text
-rustup toolchain install nightly
-```
-To compile kernels with [spirv-builder](https://docs.rs/crate/spirv-builder), a specific nightly is required:
-```text
-rustup toolchain install nightly-2025-06-30
-rustup component add --toolchain nightly-2025-06-30 rust-src rustc-dev llvm-tools
+rustup toolchain install nightly-2026-05-22
+rustup component add --toolchain nightly-2026-05-22 rust-src rustc-dev llvm-tools
 ```
 
 ## Installing
 With spirv-tools from the [LunarG Vulkan SDK](https://www.lunarg.com/vulkan-sdk/) installed (will save significant compile time):
 ```text
-cargo +nightly-2025-06-30 install krnlc --locked --no-default-features \
+cargo +nightly-2026-05-22 install --path krnlc --locked --no-default-features \
  --features use-installed-tools
 ```
 Otherwise:
 ```text
-cargo +nightly-2025-06-30 install krnlc --locked
+cargo +nightly-2026-05-22 install --path krnlc --locked
 ```
 
 ## Metadata

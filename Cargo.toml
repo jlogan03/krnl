@@ -5,7 +5,7 @@ members = ["benches/*", "tests/*"]
 version = "0.1.2-alpha"
 authors = ["Charles R Earp <charles.r.earp@gmail.com>"]
 edition = "2021"
-rust-version = "1.70.0"
+rust-version = "1.95.0"
 documentation = "https://docs.rs/krnl"
 readme = "README.md"
 homepage = "https://github.com/charles-r-earp/krnl"
@@ -29,7 +29,7 @@ half = { version = "2.1.0", default-features = false, features = [
 num-traits = { version = "0.2.14", default-features = false }
 thiserror = "1.0.31"
 bincode2 = "2.0.1"
-rspirv = "0.12"
+rspirv = "0.13"
 flate2 = "1.0.25"
 hex = "0.4.3"
 rustversion = "1.0.12"
