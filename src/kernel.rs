@@ -78,6 +78,24 @@ fn main() -> Result<()> {
 ```
 
 # krnlc
+
+## Floating-point behavior
+
+Ordinary floating-point arithmetic in device kernels preserves subnormals and
+uses round-to-nearest/ties-to-even, without reassociation or implicit FMA
+contraction. `#[kernel(fast_math)]` allows reassociation, contraction, reciprocal
+transformations and ignoring signed zero, and flushes subnormals to zero.
+Neither policy assumes inputs cannot be NaN or infinity. Explicit Rust
+`algebraic_*` operations allow reordering under either policy, while `mul_add`
+remains explicitly fused.
+
+These policies require Vulkan `shaderFloatControls2` and the appropriate
+per-width floating-point properties. Unsupported policies return an error when
+building a kernel; they are never silently relaxed. This does not guarantee full
+IEEE-754 accuracy for division or transcendental functions. Recompile existing
+kernel caches with this fork's `krnlc` to use the new defaults.
+
+## Compilation
 [Kernels](#kernels) are compiled with krnlc.
 
 Compile with `krnlc` or `krnlc -p my-crate`.
@@ -596,7 +614,7 @@ impl KernelDesc {
         debug_printf: bool,
     ) -> Result<Self> {
         use rspirv::spirv::{Decoration, Op};
-        let mut module = rspirv::dr::load_words(&self.spirv).unwrap();
+        let mut module = crate::spirv::load_words(&self.spirv)?;
         let mut spec_ids = HashMap::<u32, u32>::with_capacity(spec_consts.len());
         let mut spec_string = format!("threads={threads}");
         use std::fmt::Write;

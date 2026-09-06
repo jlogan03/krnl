@@ -20,13 +20,14 @@ use std::{
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        pool::{CommandBufferAllocateInfo, CommandPool, CommandPoolAlloc, CommandPoolCreateInfo},
-        sys::{CommandBufferBeginInfo, UnsafeCommandBuffer, UnsafeCommandBufferBuilder},
-        CommandBufferLevel, CommandBufferUsage, CopyBufferInfo,
+        allocator::StandardCommandBufferAllocator, CommandBuffer as UnsafeCommandBuffer,
+        CommandBufferBeginInfo, CommandBufferLevel, CommandBufferUsage, CopyBufferInfo,
+        RecordingCommandBuffer as UnsafeCommandBufferBuilder,
     },
     descriptor_set::{
+        allocator::StandardDescriptorSetAllocator,
         layout::{DescriptorSetLayout, DescriptorType},
-        pool::{DescriptorPool, DescriptorPoolCreateInfo, DescriptorSetAllocateInfo},
+        sys::RawDescriptorSet,
         WriteDescriptorSet,
     },
     device::{
@@ -35,20 +36,17 @@ use vulkano::{
     instance::{
         debug::{
             DebugUtilsMessageSeverity, DebugUtilsMessageType, DebugUtilsMessenger,
-            DebugUtilsMessengerCreateInfo,
+            DebugUtilsMessengerCallback, DebugUtilsMessengerCreateInfo,
         },
-        Instance, InstanceCreateInfo, InstanceExtensions, Version,
+        Instance, InstanceCreateFlags, InstanceCreateInfo, InstanceExtensions,
     },
     library::VulkanLibrary,
     memory::allocator::{
-        AllocationCreateInfo, GenericMemoryAllocatorCreateInfo, MemoryUsage,
+        AllocationCreateInfo, GenericMemoryAllocatorCreateInfo, MemoryTypeFilter,
         StandardMemoryAllocator,
     },
     pipeline::{ComputePipeline, Pipeline, PipelineBindPoint},
-    shader::{
-        DescriptorBindingRequirements, DescriptorRequirements, ShaderExecution, ShaderInterface,
-        ShaderModule, ShaderStages,
-    },
+    shader::{ShaderModule, ShaderStages},
     sync::semaphore::Semaphore,
     VulkanObject,
 };
@@ -166,36 +164,33 @@ impl DeviceEngine for Engine {
         let debug_create_info = DebugUtilsMessengerCreateInfo {
             message_severity: DebugUtilsMessageSeverity::INFO,
             message_type: DebugUtilsMessageType::VALIDATION,
-            ..DebugUtilsMessengerCreateInfo::user_callback(Arc::new(move |msg| {
-                if debug_printf2.load(Ordering::SeqCst) {
-                    return;
-                }
-                if msg.layer_prefix
-                    == Some("UNASSIGNED-khronos-validation-createinstance-status-message")
-                    && msg.description.contains("Khronos Validation Layer Active:")
-                    && msg
-                        .description
-                        .contains("Current Enables: VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT.")
-                {
-                    debug_printf2.store(true, Ordering::SeqCst);
-                }
-            }))
+            ..DebugUtilsMessengerCreateInfo::user_callback(unsafe {
+                DebugUtilsMessengerCallback::new(move |_, _, msg| {
+                    if debug_printf2.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if msg.message_id_name
+                        == Some("UNASSIGNED-khronos-validation-createinstance-status-message")
+                        && msg.message.contains("Khronos Validation Layer Active:")
+                        && msg.message.contains(
+                            "Current Enables: VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT.",
+                        )
+                    {
+                        debug_printf2.store(true, Ordering::SeqCst);
+                    }
+                })
+            })
         };
         let instance_create_info = InstanceCreateInfo {
             enabled_extensions: InstanceExtensions {
                 ext_debug_utils: true,
                 ..Default::default()
             },
-            enumerate_portability: true,
+            flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
+            debug_utils_messengers: vec![debug_create_info],
             ..InstanceCreateInfo::application_from_cargo_toml()
         };
-        let instance = unsafe {
-            Instance::with_debug_utils_messengers(
-                library,
-                instance_create_info,
-                [debug_create_info],
-            )?
-        };
+        let instance = Instance::new(library, instance_create_info)?;
         let debug_printf = debug_printf.load(Ordering::SeqCst);
         let mut physical_devices = instance.enumerate_physical_devices()?;
         let devices = physical_devices.len();
@@ -207,13 +202,16 @@ impl DeviceEngine for Engine {
         let name = physical_device.properties().device_name.clone();
         let optimal_device_extensions = vulkano::device::DeviceExtensions {
             khr_vulkan_memory_model: true,
+            khr_shader_float_controls: true,
+            khr_shader_float_controls2: true,
             ext_subgroup_size_control: true,
             ..vulkano::device::DeviceExtensions::empty()
         };
         let device_extensions = physical_device
             .supported_extensions()
             .intersection(&optimal_device_extensions);
-        let optimal_device_features = vulkano::device::Features {
+        let optimal_device_features = vulkano::device::DeviceFeatures {
+            shader_float_controls2: true,
             vulkan_memory_model: true,
             timeline_semaphore: true,
             subgroup_size_control: true,
@@ -226,7 +224,7 @@ impl DeviceEngine for Engine {
             storage_buffer16_bit_access: optimal_features.contains(Features::BUFFER16),
             storage_push_constant8: optimal_features.contains(Features::PUSH_CONSTANT8),
             storage_push_constant16: optimal_features.contains(Features::PUSH_CONSTANT16),
-            ..vulkano::device::Features::empty()
+            ..vulkano::device::DeviceFeatures::empty()
         };
         let device_features = physical_device
             .supported_features()
@@ -264,14 +262,25 @@ impl DeviceEngine for Engine {
         let memory_allocator = Arc::new(StandardMemoryAllocator::new(
             device.clone(),
             GenericMemoryAllocatorCreateInfo {
-                block_sizes: &[
-                    (0, 64_000_000),
-                    (DeviceBuffer::MAX_SIZE as _, DeviceBuffer::MAX_SIZE as _),
-                ],
+                block_sizes: &device
+                    .physical_device()
+                    .memory_properties()
+                    .memory_types
+                    .iter()
+                    .map(|memory_type| {
+                        let heap = &device.physical_device().memory_properties().memory_heaps
+                            [memory_type.heap_index as usize];
+                        if heap.size >= DeviceBuffer::MAX_SIZE as u64 {
+                            DeviceBuffer::MAX_SIZE as u64
+                        } else {
+                            64_000_000
+                        }
+                    })
+                    .collect::<Vec<_>>(),
                 dedicated_allocation: false,
                 ..Default::default()
             },
-        )?);
+        ));
         let (host_buffer_sender, host_buffer_receiver) = crossbeam_channel::bounded(2);
         for _ in 0..2 {
             let buffer_info = BufferCreateInfo {
@@ -279,11 +288,12 @@ impl DeviceEngine for Engine {
                 ..Default::default()
             };
             let allocation_info = AllocationCreateInfo {
-                usage: MemoryUsage::Download,
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                    | MemoryTypeFilter::HOST_RANDOM_ACCESS,
                 ..Default::default()
             };
             let inner = Buffer::new_slice(
-                &memory_allocator,
+                memory_allocator.clone(),
                 buffer_info,
                 allocation_info,
                 DeviceBuffer::HOST_BUFFER_SIZE as u64,
@@ -419,14 +429,14 @@ impl DeviceEngine for Engine {
 
 fn new_semaphore(device: &Arc<Device>) -> Result<Semaphore> {
     let mut semaphore = MaybeUninit::uninit();
-    let mut semaphore_type_create_info = ash::vk::SemaphoreTypeCreateInfo::builder()
+    let mut semaphore_type_create_info = ash::vk::SemaphoreTypeCreateInfo::default()
         .semaphore_type(ash::vk::SemaphoreType::TIMELINE);
     let semaphore_create_info =
-        ash::vk::SemaphoreCreateInfo::builder().push_next(&mut semaphore_type_create_info);
+        ash::vk::SemaphoreCreateInfo::default().push_next(&mut semaphore_type_create_info);
     unsafe {
         (device.fns().v1_0.create_semaphore)(
             device.handle(),
-            &*semaphore_create_info,
+            &semaphore_create_info,
             std::ptr::null(),
             semaphore.as_mut_ptr(),
         )
@@ -449,10 +459,10 @@ unsafe fn queue_submit(
 ) -> Result<(), ash::vk::Result> {
     let command_buffers = &[command_buffer.handle()];
     let signal_semaphore_values = &[epoch];
-    let mut semaphore_submit_info = ash::vk::TimelineSemaphoreSubmitInfo::builder()
+    let mut semaphore_submit_info = ash::vk::TimelineSemaphoreSubmitInfo::default()
         .signal_semaphore_values(signal_semaphore_values);
     let signal_semaphores = &[semaphore.handle()];
-    let submit_info = ash::vk::SubmitInfo::builder()
+    let submit_info = ash::vk::SubmitInfo::default()
         .command_buffers(command_buffers)
         .signal_semaphores(signal_semaphores)
         .push_next(&mut semaphore_submit_info);
@@ -472,10 +482,10 @@ unsafe fn queue_submit(
 unsafe fn wait_semaphore(device: &Device, semaphore: &Semaphore, value: u64) -> ash::vk::Result {
     let semaphores = &[semaphore.handle()];
     let values = &[value];
-    let semaphore_wait_info = ash::vk::SemaphoreWaitInfo::builder()
+    let semaphore_wait_info = ash::vk::SemaphoreWaitInfo::default()
         .semaphores(semaphores)
         .values(values);
-    unsafe { (device.fns().v1_2.wait_semaphores)(device.handle(), &*semaphore_wait_info, 0) }
+    unsafe { (device.fns().v1_2.wait_semaphores)(device.handle(), &semaphore_wait_info, 0) }
 }
 
 struct HostBuffer {
@@ -572,75 +582,54 @@ impl FrameOuter {
 
 struct Frame {
     queue: Arc<Queue>,
-    _command_pool: CommandPool,
-    command_pool_alloc: CommandPoolAlloc,
+    command_allocator: Arc<StandardCommandBufferAllocator>,
     command_buffer_builder: Option<UnsafeCommandBufferBuilder>,
-    descriptor_pool: DescriptorPool,
+    descriptor_allocator: Arc<StandardDescriptorSetAllocator>,
+    descriptor_sets: Vec<RawDescriptorSet>,
     buffers: Vec<Subbuffer<[u8]>>,
     epoch: u64,
     debug_kernel_desc_panic: Option<(Arc<KernelDesc>, Arc<AtomicBool>)>,
 }
+
+// SAFETY: Each frame owns a private command allocator, used only by this frame.
+// Frame access (including recording, ending and allocation) is exclusive: either
+// behind its mutex or owned by the worker. No other frame shares its command pool.
+unsafe impl Send for Frame {}
 
 impl Frame {
     const MAX_KERNELS: u32 = 4;
     const MAX_DESCRIPTORS: u32 = 32;
     fn new(queue: Arc<Queue>) -> Result<Self> {
         let device = queue.device();
-        let command_pool = CommandPool::new(
+        let command_allocator = Arc::new(StandardCommandBufferAllocator::new(
             device.clone(),
-            CommandPoolCreateInfo {
-                queue_family_index: queue.queue_family_index(),
-                transient: true,
-                reset_command_buffer: true,
-                ..Default::default()
-            },
-        )?;
-        let command_pool_alloc = command_pool
-            .allocate_command_buffers(CommandBufferAllocateInfo {
-                level: CommandBufferLevel::Primary,
-                command_buffer_count: 1,
-                ..Default::default()
-            })
-            .unwrap()
-            .next()
-            .unwrap();
+            Default::default(),
+        ));
         let command_buffer_builder = None;
-        let descriptor_pool = DescriptorPool::new(
+        let descriptor_allocator = Arc::new(StandardDescriptorSetAllocator::new(
             device.clone(),
-            DescriptorPoolCreateInfo {
-                max_sets: Self::MAX_DESCRIPTORS,
-                pool_sizes: [(DescriptorType::StorageBuffer, Self::MAX_DESCRIPTORS)]
-                    .into_iter()
-                    .collect(),
-                ..Default::default()
-            },
-        )?;
+            Default::default(),
+        ));
         let buffers = Vec::new();
         let epoch = 0;
         Ok(Self {
             queue,
-            _command_pool: command_pool,
-            command_pool_alloc,
+            command_allocator,
             command_buffer_builder,
-            descriptor_pool,
+            descriptor_allocator,
+            descriptor_sets: Vec::new(),
             buffers,
             epoch,
             debug_kernel_desc_panic: None,
         })
     }
     unsafe fn begin(&mut self) -> Result<()> {
-        let device = self.queue.device();
-        unsafe {
-            (device.fns().v1_0.reset_command_buffer)(
-                self.command_pool_alloc.handle(),
-                Default::default(),
-            )
-            .result()?;
-            self.descriptor_pool.reset()?;
-        }
-        self.command_buffer_builder.replace(unsafe {
+        self.descriptor_sets.clear();
+        self.command_buffer_builder.replace({
             UnsafeCommandBufferBuilder::new(
-                &self.command_pool_alloc,
+                self.command_allocator.clone(),
+                self.queue.queue_family_index(),
+                CommandBufferLevel::Primary,
                 CommandBufferBeginInfo {
                     usage: CommandBufferUsage::OneTimeSubmit,
                     ..Default::default()
@@ -658,7 +647,9 @@ impl Frame {
     ) {
         let builder = self.command_buffer_builder.as_mut().unwrap();
         unsafe {
-            builder.copy_buffer(&CopyBufferInfo::buffers(src.clone(), dst.clone()));
+            builder
+                .copy_buffer(&CopyBufferInfo::buffers(src.clone(), dst.clone()))
+                .unwrap();
         }
         self.buffers.extend_from_slice(&[src, dst]);
         host_buffer.epoch = self.epoch;
@@ -677,49 +668,52 @@ impl Frame {
     ) {
         let builder = self.command_buffer_builder.as_mut().unwrap();
         unsafe {
-            builder.bind_pipeline_compute(pipeline);
+            builder.bind_pipeline_compute(pipeline).unwrap();
         }
         let pipeline_layout = pipeline.layout();
         if !buffers.is_empty() {
             let descriptor_set_layout = pipeline_layout.set_layouts().first().unwrap();
-            let write_descriptor_set = WriteDescriptorSet::buffer_array(
-                0,
-                0,
-                buffers.iter().map(|x| x.inner.as_ref().unwrap().clone()),
-            );
+            let writes: Vec<_> = buffers
+                .iter()
+                .enumerate()
+                .map(|(binding, x)| {
+                    WriteDescriptorSet::buffer(binding as u32, x.inner.as_ref().unwrap().clone())
+                })
+                .collect();
             unsafe {
-                let mut descriptor_set = self
-                    .descriptor_pool
-                    .allocate_descriptor_sets([DescriptorSetAllocateInfo {
-                        layout: descriptor_set_layout,
-                        variable_descriptor_count: 0,
-                    }])
-                    .unwrap()
-                    .next()
-                    .unwrap();
-                descriptor_set.write(descriptor_set_layout, [&write_descriptor_set]);
-                builder.bind_descriptor_sets(
-                    PipelineBindPoint::Compute,
-                    pipeline_layout,
+                let descriptor_set = RawDescriptorSet::new(
+                    self.descriptor_allocator.clone(),
+                    descriptor_set_layout,
                     0,
-                    &[descriptor_set],
-                    [],
-                );
+                )
+                .unwrap();
+                descriptor_set.update(&writes, &[]).unwrap();
+                builder
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Compute,
+                        pipeline_layout,
+                        0,
+                        &[&descriptor_set],
+                        &[],
+                    )
+                    .unwrap();
+                self.descriptor_sets.push(descriptor_set);
             }
         }
         if !push_consts.is_empty() {
             unsafe {
-                builder.push_constants(
-                    pipeline_layout,
-                    ShaderStages::COMPUTE,
+                (builder.device().fns().v1_0.cmd_push_constants)(
+                    builder.handle(),
+                    pipeline_layout.handle(),
+                    ash::vk::ShaderStageFlags::COMPUTE,
                     0,
                     push_consts.len() as u32,
-                    push_consts,
+                    push_consts.as_ptr().cast(),
                 );
             }
         }
         unsafe {
-            builder.dispatch([groups, 1, 1]);
+            builder.dispatch([groups, 1, 1]).unwrap();
         }
         self.buffers
             .extend(buffers.iter().map(|x| x.inner.as_ref().unwrap().clone()));
@@ -803,13 +797,14 @@ impl Worker {
             }
             self.pending
                 .store(self.pending_frame.epoch, Ordering::SeqCst);
-            let command_buffer = self
-                .pending_frame
-                .command_buffer_builder
-                .take()
-                .unwrap()
-                .build()
-                .unwrap();
+            let command_buffer = unsafe {
+                self.pending_frame
+                    .command_buffer_builder
+                    .take()
+                    .unwrap()
+                    .end()
+            }
+            .unwrap();
             let _messenger = if let Some((kernel_desc, panicked)) =
                 self.pending_frame.debug_kernel_desc_panic.take()
             {
@@ -820,21 +815,21 @@ impl Worker {
                             DebugUtilsMessengerCreateInfo {
                                 message_severity: DebugUtilsMessageSeverity::INFO,
                                 message_type: DebugUtilsMessageType::VALIDATION,
-                                ..DebugUtilsMessengerCreateInfo::user_callback(Arc::new(
-                                    move |msg| {
-                                        if let Some(layer_prefix) = msg.layer_prefix.as_ref() {
+                                ..DebugUtilsMessengerCreateInfo::user_callback(
+                                    DebugUtilsMessengerCallback::new(move |_, _, msg| {
+                                        if let Some(layer_prefix) = msg.message_id_name.as_ref() {
                                             if layer_prefix.contains("DEBUG-PRINTF") {
                                                 eprintln!(
                                                     "[{id:?} {}] {}",
-                                                    kernel_desc.name, msg.description
+                                                    kernel_desc.name, msg.message
                                                 );
-                                                if msg.description.contains("[Rust panicked at ") {
+                                                if msg.message.contains("[Rust panicked at ") {
                                                     panicked.store(true, Ordering::SeqCst);
                                                 }
                                             }
                                         }
-                                    },
-                                ))
+                                    }),
+                                )
                             },
                         )
                     }
@@ -913,7 +908,7 @@ impl DeviceBuffer {
     const HOST_BUFFER_SIZE: usize = 32_000_000;
     fn host_visible(&self) -> bool {
         if let Some(inner) = self.inner.as_ref() {
-            inner.mapped_ptr().is_some()
+            inner.mapped_slice().is_ok()
         } else {
             false
         }
@@ -926,7 +921,7 @@ impl DeviceEngineBuffer for DeviceBuffer {
         &self.engine
     }
     unsafe fn uninit(engine: Arc<Engine>, len: usize) -> Result<Self> {
-        use vulkano::{memory::allocator::AllocationCreationError, VulkanError};
+        use vulkano::{memory::allocator::MemoryAllocatorError, VulkanError};
         let inner = if len > 0 {
             let len = aligned_ceil(len, Self::ALIGN);
             let usage =
@@ -937,7 +932,7 @@ impl DeviceEngineBuffer for DeviceBuffer {
                 ..Default::default()
             };
             let allocation_info = AllocationCreateInfo {
-                usage: MemoryUsage::DeviceOnly,
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             };
             use vulkano::{
@@ -957,14 +952,21 @@ impl DeviceEngineBuffer for DeviceBuffer {
                 .memory_allocator
                 .allocate(requirements, AllocationType::Unknown, allocation_info, None)
                 .map_err(|e| {
-                    if let AllocationCreationError::VulkanError(VulkanError::OutOfDeviceMemory) = e
+                    if let MemoryAllocatorError::AllocateDeviceMemory(vulkano::Validated::Error(
+                        VulkanError::OutOfDeviceMemory,
+                    )) = e
                     {
                         Error::new(OutOfDeviceMemory(engine.id())).context(e)
                     } else {
                         e.into()
                     }
                 })?;
-            debug_assert!(!memory_alloc.is_root());
+            let memory_alloc = unsafe {
+                vulkano::memory::ResourceMemory::from_allocation(
+                    engine.memory_allocator.clone(),
+                    memory_alloc,
+                )
+            };
             let buffer = raw_buffer
                 .bind_memory(memory_alloc)
                 .map_err(|(e, _, _)| e)?;
@@ -1203,41 +1205,176 @@ struct KernelInner {
     compute_pipeline: Arc<ComputePipeline>,
 }
 
+fn prepare_float_controls(device: &Device, desc: &KernelDesc) -> Result<Vec<u32>> {
+    prepare_float_controls_with_properties(
+        &desc.spirv,
+        &desc.name,
+        device.enabled_features().shader_float_controls2,
+        device.physical_device().properties(),
+    )
+}
+
+fn prepare_float_controls_with_properties(
+    spirv: &[u32],
+    kernel_name: &str,
+    controls2: bool,
+    properties: &vulkano::device::DeviceProperties,
+) -> Result<Vec<u32>> {
+    use rspirv::spirv::{Capability, ExecutionMode, Op};
+    use rspirv::{
+        binary::Assemble,
+        dr::{Instruction, Operand},
+    };
+    use vulkano::device::physical::ShaderFloatControlsIndependence;
+    let mut module = crate::spirv::load_words(spirv)?;
+    if module
+        .capabilities
+        .iter()
+        .any(|inst| inst.operands[0].unwrap_capability() == Capability::FloatControls2)
+        && !controls2
+    {
+        anyhow::bail!(
+            "kernel `{}` requires Vulkan shaderFloatControls2",
+            kernel_name
+        );
+    }
+    for mode in &module.execution_modes {
+        if mode.operands[1].unwrap_execution_mode() != ExecutionMode::FPFastMathDefault {
+            continue;
+        }
+        let ty = mode.operands[2].unwrap_id_ref();
+        let width = module
+            .types_global_values
+            .iter()
+            .find(|inst| inst.class.opcode == Op::TypeFloat && inst.result_id == Some(ty))
+            .ok_or_else(|| anyhow::anyhow!("invalid FPFastMathDefault target type"))?
+            .operands[0]
+            .unwrap_literal_bit32();
+        // Our safe policies never assume away NaN/infinity, even when NSZ is set.
+        // Vulkan requires this property when any of those fast-math bits is absent.
+        let supported = match width {
+            16 => properties.shader_signed_zero_inf_nan_preserve_float16,
+            32 => properties.shader_signed_zero_inf_nan_preserve_float32,
+            64 => properties.shader_signed_zero_inf_nan_preserve_float64,
+            _ => None,
+        };
+        if supported != Some(true) {
+            anyhow::bail!(
+                "kernel `{}` requires shaderSignedZeroInfNanPreserveFloat{}",
+                kernel_name,
+                width
+            );
+        }
+    }
+    // Restricted independence requires matching modes even for widths unused
+    // by this kernel. Complete those modes per device, without adding types or
+    // relaxing the arithmetic policy. Pipeline validation checks their support.
+    for (independence, candidates) in [
+        (
+            properties.denorm_behavior_independence,
+            [
+                ExecutionMode::DenormPreserve,
+                ExecutionMode::DenormFlushToZero,
+            ],
+        ),
+        (
+            properties.rounding_mode_independence,
+            [
+                ExecutionMode::RoundingModeRTE,
+                ExecutionMode::RoundingModeRTZ,
+            ],
+        ),
+    ] {
+        let widths: &[u32] = match independence {
+            Some(ShaderFloatControlsIndependence::Float32Only) => &[16, 64],
+            Some(ShaderFloatControlsIndependence::None) => &[16, 32, 64],
+            _ => continue,
+        };
+        let existing: Vec<_> = module
+            .execution_modes
+            .iter()
+            .filter(|inst| {
+                candidates.contains(&inst.operands[1].unwrap_execution_mode())
+                    && widths.contains(&inst.operands[2].unwrap_literal_bit32())
+            })
+            .cloned()
+            .collect();
+        if let Some(first) = existing.first() {
+            for width in widths {
+                if !existing
+                    .iter()
+                    .any(|inst| inst.operands[2] == Operand::LiteralBit32(*width))
+                {
+                    module.execution_modes.push(Instruction::new(
+                        Op::ExecutionMode,
+                        None,
+                        None,
+                        vec![
+                            first.operands[0].clone(),
+                            first.operands[1].clone(),
+                            Operand::LiteralBit32(*width),
+                        ],
+                    ));
+                }
+            }
+        }
+    }
+    for inst in &module.execution_modes {
+        let mode = inst.operands[1].unwrap_execution_mode();
+        if !matches!(
+            mode,
+            ExecutionMode::DenormPreserve
+                | ExecutionMode::DenormFlushToZero
+                | ExecutionMode::RoundingModeRTE
+                | ExecutionMode::RoundingModeRTZ
+        ) {
+            continue;
+        }
+        let width = inst.operands[2].unwrap_literal_bit32();
+        let (preserve, flush, rte, rtz) = match width {
+            16 => (
+                properties.shader_denorm_preserve_float16,
+                properties.shader_denorm_flush_to_zero_float16,
+                properties.shader_rounding_mode_rte_float16,
+                properties.shader_rounding_mode_rtz_float16,
+            ),
+            32 => (
+                properties.shader_denorm_preserve_float32,
+                properties.shader_denorm_flush_to_zero_float32,
+                properties.shader_rounding_mode_rte_float32,
+                properties.shader_rounding_mode_rtz_float32,
+            ),
+            64 => (
+                properties.shader_denorm_preserve_float64,
+                properties.shader_denorm_flush_to_zero_float64,
+                properties.shader_rounding_mode_rte_float64,
+                properties.shader_rounding_mode_rtz_float64,
+            ),
+            _ => (None, None, None, None),
+        };
+        let supported = match mode {
+            ExecutionMode::DenormPreserve => preserve,
+            ExecutionMode::DenormFlushToZero => flush,
+            ExecutionMode::RoundingModeRTE => rte,
+            _ => rtz,
+        };
+        if supported != Some(true) {
+            anyhow::bail!("kernel `{kernel_name}` requires {mode:?} for f{width}, which this device does not support");
+        }
+    }
+    // Vulkano also validates these modes and mixed-width independence.
+    Ok(module.assemble())
+}
+
 impl KernelInner {
     fn new(engine: &Arc<Engine>, desc: Arc<KernelDesc>) -> Result<Self> {
         use vulkano::{
             descriptor_set::layout::{DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo},
             pipeline::layout::{PipelineLayout, PipelineLayoutCreateInfo, PushConstantRange},
-            shader::{spirv::ExecutionModel, EntryPointInfo},
+            pipeline::{compute::ComputePipelineCreateInfo, PipelineShaderStageCreateInfo},
         };
         let device = engine.queue.device();
-        let descriptor_binding_requirements = desc
-            .slice_descs
-            .iter()
-            .enumerate()
-            .map(|(i, desc)| {
-                let set = 0;
-                let binding = i.try_into().unwrap();
-                let memory_write = if desc.mutable {
-                    ShaderStages::COMPUTE
-                } else {
-                    ShaderStages::empty()
-                };
-                let descriptors = DescriptorRequirements {
-                    memory_read: ShaderStages::COMPUTE,
-                    memory_write,
-                    ..DescriptorRequirements::default()
-                };
-                let descriptor_binding_requirements = DescriptorBindingRequirements {
-                    descriptor_types: vec![DescriptorType::StorageBuffer],
-                    descriptor_count: Some(1),
-                    stages: ShaderStages::COMPUTE,
-                    descriptors: [(Some(0), descriptors)].into_iter().collect(),
-                    ..Default::default()
-                };
-                ((set, binding), descriptor_binding_requirements)
-            })
-            .collect();
+        let spirv = prepare_float_controls(device, &desc)?;
         let push_consts_range = desc.push_consts_range();
         let push_constant_range = if push_consts_range > 0 {
             Some(PushConstantRange {
@@ -1248,28 +1385,11 @@ impl KernelInner {
         } else {
             None
         };
-        let entry_point_info = EntryPointInfo {
-            execution: ShaderExecution::Compute,
-            descriptor_binding_requirements,
-            push_constant_requirements: push_constant_range,
-            specialization_constant_requirements: Default::default(),
-            input_interface: ShaderInterface::empty(),
-            output_interface: ShaderInterface::empty(),
-        };
-        let version = Version::major_minor(1, 2);
         let entry_point = "main";
         let shader_module = unsafe {
-            ShaderModule::from_words_with_data(
+            ShaderModule::new(
                 device.clone(),
-                &desc.spirv,
-                version,
-                [],
-                [],
-                [(
-                    entry_point.to_string(),
-                    ExecutionModel::GLCompute,
-                    entry_point_info,
-                )],
+                vulkano::shader::ShaderModuleCreateInfo::new(&spirv),
             )?
         };
         let bindings = (0..desc.slice_descs.len())
@@ -1284,7 +1404,6 @@ impl KernelInner {
             .collect();
         let descriptor_set_layout_create_info = DescriptorSetLayoutCreateInfo {
             bindings,
-            push_descriptor: device.enabled_features().descriptor_buffer_push_descriptors,
             ..DescriptorSetLayoutCreateInfo::default()
         };
         let descriptor_set_layout =
@@ -1296,17 +1415,101 @@ impl KernelInner {
         };
         let pipeline_layout = PipelineLayout::new(device.clone(), pipeline_layout_create_info)?;
         let cache = None;
-        let compute_pipeline = ComputePipeline::with_pipeline_layout(
+        let compute_pipeline = ComputePipeline::new(
             device.clone(),
-            shader_module.entry_point(entry_point).unwrap(),
-            &(),
-            pipeline_layout,
             cache,
+            ComputePipelineCreateInfo::stage_layout(
+                PipelineShaderStageCreateInfo::new(shader_module.entry_point(entry_point).unwrap()),
+                pipeline_layout,
+            ),
         )?;
         Ok(Self {
             desc,
             compute_pipeline,
         })
+    }
+}
+
+#[cfg(test)]
+mod float_control_tests {
+    use super::prepare_float_controls_with_properties;
+    use rspirv::{
+        binary::Assemble,
+        dr::{Builder, Instruction, Operand},
+        spirv::{Capability, ExecutionMode, ExecutionModel, Op},
+    };
+    use vulkano::device::{physical::ShaderFloatControlsIndependence, DeviceProperties};
+
+    fn shader(mode: ExecutionMode) -> Vec<u32> {
+        let mut builder = Builder::new();
+        let float = builder.type_float(64, None);
+        let uint = builder.type_int(32, 0);
+        let flags = builder.constant_bit32(uint, 0);
+        let entry = builder.id();
+        builder.capability(Capability::FloatControls2);
+        builder.entry_point(ExecutionModel::GLCompute, entry, "main", []);
+        builder.module_mut().execution_modes.push(Instruction::new(
+            Op::ExecutionModeId,
+            None,
+            None,
+            vec![
+                Operand::IdRef(entry),
+                Operand::ExecutionMode(ExecutionMode::FPFastMathDefault),
+                Operand::IdRef(float),
+                Operand::IdRef(flags),
+            ],
+        ));
+        builder.execution_mode(entry, mode, [64]);
+        builder.execution_mode(entry, ExecutionMode::RoundingModeRTE, [64]);
+        builder.module().assemble()
+    }
+
+    fn properties() -> DeviceProperties {
+        DeviceProperties {
+            shader_signed_zero_inf_nan_preserve_float64: Some(true),
+            shader_denorm_preserve_float64: Some(true),
+            shader_denorm_preserve_float16: Some(true),
+            shader_rounding_mode_rte_float64: Some(true),
+            shader_rounding_mode_rte_float16: Some(true),
+            denorm_behavior_independence: Some(ShaderFloatControlsIndependence::Float32Only),
+            rounding_mode_independence: Some(ShaderFloatControlsIndependence::Float32Only),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_policies() {
+        let props = properties();
+        let strict = shader(ExecutionMode::DenormPreserve);
+        let error =
+            prepare_float_controls_with_properties(&strict, "strict", false, &props).unwrap_err();
+        assert!(error.to_string().contains("shaderFloatControls2"));
+        let fast = shader(ExecutionMode::DenormFlushToZero);
+        let error =
+            prepare_float_controls_with_properties(&fast, "fast", true, &props).unwrap_err();
+        assert!(error.to_string().contains("DenormFlushToZero"));
+    }
+
+    #[test]
+    fn completes_companion_modes_without_adding_float_types() {
+        let words = prepare_float_controls_with_properties(
+            &shader(ExecutionMode::DenormPreserve),
+            "strict",
+            true,
+            &properties(),
+        )
+        .unwrap();
+        let module = crate::spirv::load_words(words).unwrap();
+        assert!(module.execution_modes.iter().any(|mode| mode.operands[1..]
+            == [
+                Operand::ExecutionMode(ExecutionMode::DenormPreserve),
+                Operand::LiteralBit32(16)
+            ]));
+        assert!(!module
+            .types_global_values
+            .iter()
+            .any(|inst| inst.class.opcode == Op::TypeFloat
+                && inst.operands[0] == Operand::LiteralBit32(16)));
     }
 }
 

@@ -15,6 +15,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: 0
+defaults:
+  run:
+    working-directory: krnl
 jobs:
   test:
     runs-on: ${{ matrix.os }}
@@ -31,6 +34,13 @@ jobs:
             target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: krnl
+      - uses: actions/checkout@v4
+        with:
+          repository: jlogan03/rust-gpu
+          ref: jlogan/consistent-floats
+          path: rust-gpu
       - name: install toolchains
         run: |
           rustup set profile minimal
@@ -75,12 +85,18 @@ jobs:
             target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: krnl
+      - uses: actions/checkout@v4
+        with:
+          repository: jlogan03/rust-gpu
+          ref: jlogan/consistent-floats
+          path: rust-gpu
       - name: install toolchains
         run: |
           rustup set profile minimal
           rustup toolchain install stable nightly --no-self-update
           rustup toolchain install nightly-2026-05-22 --component rust-src,rustc-dev,llvm-tools --no-self-update
-      - uses: actions/checkout@v4
       - name: check krnlc
         run: cargo +nightly-2026-05-22 -Zunstable-options -C=krnlc check --locked -vv
       - name: install krnlc
@@ -92,6 +108,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: krnl
+      - uses: actions/checkout@v4
+        with:
+          repository: jlogan03/rust-gpu
+          ref: jlogan/consistent-floats
+          path: rust-gpu
       - name: install toolchains
         run: |
           rustup set profile minimal
@@ -126,7 +149,16 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v1
+        with:
+          path: krnl
+      - uses: actions/checkout@v4
+        with:
+          repository: jlogan03/rust-gpu
+          ref: jlogan/consistent-floats
+          path: rust-gpu
       - uses: EmbarkStudios/cargo-deny-action@v1
         with:
-          manifest-path: "krnlc/Cargo.toml"
+          manifest-path: "krnl/Cargo.toml"
+      - uses: EmbarkStudios/cargo-deny-action@v1
+        with:
+          manifest-path: "krnl/krnlc/Cargo.toml"

@@ -218,12 +218,13 @@ impl ToTokens for ModuleItem {
 
 #[proc_macro_attribute]
 pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
+    let fast_math = attr.to_string() == "fast_math";
+    if !attr.is_empty() && !fast_math {
         return Error::new_spanned(TokenStream2::from(attr), "unexpected tokens")
             .into_compile_error()
             .into();
     }
-    match kernel_impl(item.into()) {
+    match kernel_impl(item.into(), fast_math) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.into_compile_error().into(),
     }
@@ -1381,7 +1382,8 @@ impl ToTokens for PushDesc {
     }
 }
 
-fn kernel_impl(item_tokens: TokenStream2) -> Result<TokenStream2> {
+fn kernel_impl(item_tokens: TokenStream2, fast_math: bool) -> Result<TokenStream2> {
+    let float_policy = fast_math.then(|| quote!(, fast_math));
     let item: KernelItem = syn::parse2(item_tokens.clone())?;
     let kernel_meta = item.meta()?;
     let kernel_desc = kernel_meta.desc()?;
@@ -1456,7 +1458,7 @@ fn kernel_impl(item_tokens: TokenStream2) -> Result<TokenStream2> {
         quote! {
             #push_struct_tokens
             #[cfg(target_arch = "spirv")]
-            #[::krnl_core::spirv_std::spirv(compute(threads(1)))]
+            #[::krnl_core::spirv_std::spirv(compute(threads(1) #float_policy))]
             #[allow(unused)]
             pub fn #ident(
                 #push_consts_arg

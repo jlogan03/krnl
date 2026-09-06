@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+#[path = "../../src/spirv.rs"]
+mod spirv;
+
 use anyhow::{bail, Error, Result};
 use cargo_metadata::{Metadata, Package, PackageId};
 use clap::Parser;
@@ -663,8 +666,11 @@ crate-type = ["dylib"]
     }
     let output = builder.build()?;
     let spirv_path = output.module.unwrap_single();
-    let mut spirv_module = rspirv::dr::load_bytes(std::fs::read(spirv_path)?)
-        .map_err(|e| Error::msg(e.to_string()))?;
+    let mut spirv_module = spirv::load_words(
+        &spirv_tools::binary::to_binary(&std::fs::read(spirv_path)?)
+            .map_err(|err| Error::msg(err.to_string()))?,
+    )
+    .map_err(|e| Error::msg(e.to_string()))?;
     if debug_printf {
         spirv_module
             .debug_string_source
@@ -807,11 +813,12 @@ fn kernel_post_process(
 
     let entry_id = entry_point.operands[1].unwrap_id_ref();
     let kernel_name = entry_point.operands[2].unwrap_literal_string();
-    let execution_mode = spirv_module
+    let execution_modes = spirv_module
         .execution_modes
         .iter()
-        .find(|inst| inst.operands.first().unwrap().unwrap_id_ref() == entry_id)
-        .unwrap();
+        .filter(|inst| inst.operands.first().unwrap().unwrap_id_ref() == entry_id)
+        .cloned()
+        .collect();
     let functions = spirv_module
         .functions
         .iter()
@@ -824,13 +831,13 @@ fn kernel_post_process(
     let kernel_desc = (|| -> Result<KernelDesc> {
         let spirv_module = Module {
             entry_points: vec![entry_point.clone()],
-            execution_modes: vec![execution_mode.clone()],
+            execution_modes,
             functions,
             ..spirv_module.clone()
         };
         let spirv = spirv_module.assemble();
         let spirv = spirv_opt(&spirv, SpirvOptKind::DeadCodeElimination)?;
-        let mut spirv_module = rspirv::dr::load_words(&spirv).map_err(|e| Error::msg(e.to_string()))?;
+        let mut spirv_module = spirv::load_words(&spirv)?;
         if debug_printf {
             strip_unused_debug_strings(&mut spirv_module);
             strip_unused_types(&mut spirv_module);
@@ -876,6 +883,26 @@ fn kernel_post_process(
                 }
             }
             let mut kernel_data_ptrs = FxHashMap::default();
+            kernel_data_ptrs.insert(kernel_data_var, Vec::<u32>::new());
+            // Optimizers may leave chained or in-bounds access chains when
+            // strict floating-point controls inhibit unrelated transformations.
+            loop {
+                let mut changed = false;
+                for inst in spirv_module.functions.iter().flat_map(|f| f.all_inst_iter()) {
+                    if matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain) {
+                        let id = inst.result_id.unwrap();
+                        if !kernel_data_ptrs.contains_key(&id) {
+                            if let Some(path) = kernel_data_ptrs.get(&inst.operands[0].unwrap_id_ref()) {
+                                let mut path = path.clone();
+                                path.extend(inst.operands[1..].iter().map(|op| op.unwrap_id_ref()));
+                                kernel_data_ptrs.insert(id, path);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if !changed { break; }
+            }
             let mut kernel_data_stores = FxHashMap::default();
             for function in spirv_module.functions.iter_mut() {
                 for block in function.blocks.iter_mut() {
@@ -883,19 +910,13 @@ fn kernel_post_process(
                         let op = inst.class.opcode;
                         let operands = inst.operands.as_slice();
                         match (op, operands) {
-                            (Op::AccessChain, [Operand::IdRef(var), _, Operand::IdRef(index)]) => {
-                                if *var == kernel_data_var {
-                                    kernel_data_ptrs.insert(inst.result_id.unwrap(), *index);
-                                    return false;
-                                }
-                            }
-                            (Op::AccessChain, [Operand::IdRef(var), ..]) => {
-                                if *var == kernel_data_var {
+                            (Op::AccessChain | Op::InBoundsAccessChain, _) => {
+                                if inst.result_id.is_some_and(|id| kernel_data_ptrs.contains_key(&id)) {
                                     return false;
                                 }
                             }
                             (Op::Store, [Operand::IdRef(ptr), Operand::IdRef(value)]) => {
-                                if let Some(index) = kernel_data_ptrs.get(ptr) {
+                                if let Some(index) = kernel_data_ptrs.get(ptr).and_then(|path| path.last()) {
                                     if let Some(id) = constants.get(index) {
                                         kernel_data_stores.insert(*id, *value);
                                     }
@@ -1084,11 +1105,12 @@ fn kernel_post_process(
             Operand::LiteralString("main".to_string());
         let mut spirv_module = if !debug_printf {
             let spirv = spirv_module.assemble();
-            rspirv::dr::load_words(&spirv_opt(&spirv, SpirvOptKind::Performance)?)
+            spirv::load_words(&spirv_opt(&spirv, SpirvOptKind::Performance)?)
                 .map_err(|e| Error::msg(e.to_string()))?
         } else {
             spirv_module
         };
+        spirv::remove_unused_globals(&mut spirv_module);
         kernel_desc.name = format!("{crate_name_ident}::{kernel_name}");
         let mut features = Features::empty();
         for slice_desc in kernel_desc.slice_descs.iter() {
@@ -1209,6 +1231,18 @@ fn kernel_post_process(
                 Int64 => features.contains(Features::INT64),
                 Float16 => features.contains(Features::FLOAT16),
                 Float64 => features.contains(Features::FLOAT64),
+                FloatControls2 => spirv_module.execution_modes.iter().any(|inst|
+                    inst.operands[1] == Operand::ExecutionMode(rspirv::spirv::ExecutionMode::FPFastMathDefault))
+                    || spirv_module.annotations.iter().any(|inst|
+                        inst.operands.get(1) == Some(&Operand::Decoration(Decoration::FPFastMathMode))),
+                DenormPreserve | DenormFlushToZero | RoundingModeRTE => {
+                    let mode = match inst.operands[0].unwrap_capability() {
+                        DenormPreserve => rspirv::spirv::ExecutionMode::DenormPreserve,
+                        DenormFlushToZero => rspirv::spirv::ExecutionMode::DenormFlushToZero,
+                        _ => rspirv::spirv::ExecutionMode::RoundingModeRTE,
+                    };
+                    spirv_module.execution_modes.iter().any(|inst| inst.operands[1] == Operand::ExecutionMode(mode))
+                }
                 StorageBuffer8BitAccess => features.contains(Features::BUFFER8),
                 StorageBuffer16BitAccess => features.contains(Features::BUFFER16),
                 StoragePushConstant8 => features.contains(Features::PUSH_CONSTANT8),
@@ -1228,10 +1262,12 @@ fn kernel_post_process(
         spirv_val(&spirv)?;
         kernel_desc.features = features;
         if dump_kernels {
+            use rspirv::binary::Disassemble;
             let path = kernels_dir.join(kernel_desc.name.replace("::", "/"));
             std::fs::create_dir_all(path.parent().unwrap())?;
             let string = serde_json::to_string_pretty(&kernel_desc)?;
             std::fs::write(path.with_extension("json"), string.as_bytes())?;
+            std::fs::write(path.with_extension("spvasm"), spirv_module.disassemble())?;
             std::fs::write(
                 path.with_extension("spv"),
                 bytemuck::cast_slice(spirv.as_slice()),

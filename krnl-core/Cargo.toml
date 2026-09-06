@@ -18,7 +18,7 @@ autobenches = false
 
 [dependencies]
 krnl-macros.workspace = true
-spirv-std = { git = "https://github.com/Rust-GPU/rust-gpu.git", rev = "7fa56ad6e862cfde7938295fd6daccc2cd89a7fc" }
+spirv-std = { path = "../../rust-gpu/crates/spirv-std" }
 paste.workspace = true
 dry.workspace = true
 

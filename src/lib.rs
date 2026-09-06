@@ -40,6 +40,9 @@ For device functionality (kernels), install [Vulkan](https://www.vulkan.org) for
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+#[cfg(feature = "device")]
+mod spirv;
+
 /// anyhow
 pub extern crate anyhow;
 /// krnl-core
