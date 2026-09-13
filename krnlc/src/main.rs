@@ -101,6 +101,14 @@ fn cargo_expand(
         "--target-dir",
         target_dir,
     ]);
+    // Shared kernels live in the library when a package also has binaries or examples.
+    if package
+        .targets
+        .iter()
+        .any(|target| target.kind.iter().any(|kind| kind == "lib"))
+    {
+        command.arg("--lib");
+    }
     if verbose {
         command.arg("-v");
     }

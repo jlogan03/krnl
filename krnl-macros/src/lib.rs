@@ -1383,7 +1383,11 @@ impl ToTokens for PushDesc {
 }
 
 fn kernel_impl(item_tokens: TokenStream2, fast_math: bool) -> Result<TokenStream2> {
-    let float_policy = fast_math.then(|| quote!(, fast_math));
+    let float_policy = if fast_math {
+        quote!(, fast_math)
+    } else {
+        quote!(, rust_math)
+    };
     let item: KernelItem = syn::parse2(item_tokens.clone())?;
     let kernel_meta = item.meta()?;
     let kernel_desc = kernel_meta.desc()?;

@@ -1189,6 +1189,7 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 [[package]]
 name = "rustc_codegen_spirv"
 version = "0.10.0-alpha.1"
+source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-default#424db8d5804b5e082bd047f4ef710933526b2834"
 dependencies = [
  "ahash",
  "ar",
@@ -1222,6 +1223,7 @@ dependencies = [
 [[package]]
 name = "rustc_codegen_spirv-types"
 version = "0.10.0-alpha.1"
+source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-default#424db8d5804b5e082bd047f4ef710933526b2834"
 dependencies = [
  "rspirv",
  "semver",
@@ -1434,6 +1436,7 @@ dependencies = [
 [[package]]
 name = "spirv-builder"
 version = "0.10.0-alpha.1"
+source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-default#424db8d5804b5e082bd047f4ef710933526b2834"
 dependencies = [
  "cargo_metadata 0.21.0",
  "log",
@@ -1450,6 +1453,7 @@ dependencies = [
 [[package]]
 name = "spirv-std-types"
 version = "0.10.0-alpha.1"
+source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-default#424db8d5804b5e082bd047f4ef710933526b2834"
 
 [[package]]
 name = "spirv-tools"

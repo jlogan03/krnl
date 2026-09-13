@@ -33,8 +33,8 @@ See the docs for installation and usage instructions.
 # Installing
 
 The host library requires Rust 1.95 or newer. The kernel compiler uses
-`nightly-2026-05-22`. This development fork uses the sibling `../rust-gpu`
-checkout (`jlogan03/rust-gpu`, branch `jlogan/consistent-floats`).
+`nightly-2026-05-22`. This development fork uses `jlogan03/rust-gpu` from the
+`jlogan/float-controls-default` Git branch, pinned by the Cargo lockfiles.
 From this checkout, install it with:
 
 ```sh
@@ -50,7 +50,8 @@ For device functionality (kernels), install [Vulkan](https://www.vulkan.org) for
 
 Floating-point kernels additionally require `shaderFloatControls2` and the
 per-width properties for subnormal preservation and round-to-nearest/ties-to-even.
-Ordinary arithmetic disables reordering and implicit FMA contraction; opt in with
+krnl explicitly requests rust-gpu's `rust_math` policy by default, so ordinary
+arithmetic disables reordering and implicit FMA contraction; opt in with
 `#[kernel(fast_math)]` to allow reordering and flush subnormals to zero. Unsupported
 policies are rejected at kernel creation. Rebuild existing caches with this
 fork's `krnlc` to pick up the new defaults.
