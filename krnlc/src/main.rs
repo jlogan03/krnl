@@ -170,6 +170,31 @@ struct KrnlcMetadata {
     dependencies: String,
 }
 
+fn git_dependency_source(source: &str) -> Result<String> {
+    let mut url = url::Url::parse(source)?;
+    let reference: String = url
+        .query_pairs()
+        .map(|(key, value)| format!(", {key} = {value:?}"))
+        .collect();
+    url.set_query(None);
+    Ok(format!("git = {:?}{reference}", url.as_str()))
+}
+
+#[test]
+fn git_dependency_references() {
+    let git = "ssh://git@github.com/owner/repo";
+    assert_eq!(
+        git_dependency_source(git).unwrap(),
+        format!("git = {git:?}")
+    );
+    for key in ["branch", "tag", "rev"] {
+        assert_eq!(
+            git_dependency_source(&format!("{git}?{key}=feature%2Fmath")).unwrap(),
+            format!("git = {git:?}, {key} = \"feature/math\"")
+        );
+    }
+}
+
 impl KrnlcMetadata {
     fn new(metadata: &Metadata, package: &Package) -> Result<Self> {
         use std::fmt::Write;
@@ -270,6 +295,8 @@ impl KrnlcMetadata {
                                 if source == "registry+https://github.com/rust-lang/crates.io-index"
                                 {
                                     format!("version = \"{}\"", dependency.req)
+                                } else if let Some(git) = source.strip_prefix("git+") {
+                                    git_dependency_source(git)?
                                 } else if let Some((key, value)) = source.split_once('+') {
                                     format!("{key} = {value:?}")
                                 } else {

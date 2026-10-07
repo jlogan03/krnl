@@ -43,6 +43,7 @@ bytemuck = "1.13.1"
 prettyplease = "0.1.25"
 walkdir = "2.4.0"
 zero85 = "0.2.0"
+url = "2.5"
 
 [features]
 default = ["use-compiled-tools"]
