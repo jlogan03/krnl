@@ -39,7 +39,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: jlogan03/rust-gpu
-          ref: jlogan/consistent-floats
+          ref: jlogan/float-controls-intrinsics
           path: rust-gpu
       - name: install toolchains
         run: |
@@ -90,7 +90,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: jlogan03/rust-gpu
-          ref: jlogan/consistent-floats
+          ref: jlogan/float-controls-intrinsics
           path: rust-gpu
       - name: install toolchains
         run: |
@@ -113,7 +113,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: jlogan03/rust-gpu
-          ref: jlogan/consistent-floats
+          ref: jlogan/float-controls-intrinsics
           path: rust-gpu
       - name: install toolchains
         run: |
@@ -154,7 +154,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: jlogan03/rust-gpu
-          ref: jlogan/consistent-floats
+          ref: jlogan/float-controls-intrinsics
           path: rust-gpu
       - uses: EmbarkStudios/cargo-deny-action@v1
         with:

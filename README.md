@@ -34,7 +34,7 @@ See the docs for installation and usage instructions.
 
 The host library requires Rust 1.95 or newer. The kernel compiler uses
 `nightly-2026-05-22`. This development fork uses `jlogan03/rust-gpu` from the
-`jlogan/float-controls-default` Git branch, pinned by the Cargo lockfiles.
+`jlogan/float-controls-intrinsics` Git branch, pinned by the Cargo lockfiles.
 From this checkout, install it with:
 
 ```sh

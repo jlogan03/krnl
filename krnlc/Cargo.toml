@@ -26,7 +26,7 @@ clap-cargo = { version = "0.13.0", features = ["cargo_metadata"] }
 anyhow = "1.0.60"
 syn = { version = "1.0.103", features = ["full", "visit", "extra-traits"] }
 cargo_metadata = "0.18.1"
-spirv-builder = { git = "https://github.com/jlogan03/rust-gpu", branch = "jlogan/float-controls-default", default-features = false }
+spirv-builder = { git = "https://github.com/jlogan03/rust-gpu", branch = "jlogan/float-controls-intrinsics", default-features = false }
 serde = { version = "1.0.143", default-features = false, features = ["derive"] }
 bincode2 = "2.0.1"
 symlink = "0.1.0"
@@ -56,5 +56,5 @@ use-installed-tools = [
 ]
 
 [patch.crates-io]
-rustc_codegen_spirv = { git = "https://github.com/jlogan03/rust-gpu", branch = "jlogan/float-controls-default" }
-rustc_codegen_spirv-types = { git = "https://github.com/jlogan03/rust-gpu", branch = "jlogan/float-controls-default" }
+rustc_codegen_spirv = { git = "https://github.com/jlogan03/rust-gpu", branch = "jlogan/float-controls-intrinsics" }
+rustc_codegen_spirv-types = { git = "https://github.com/jlogan03/rust-gpu", branch = "jlogan/float-controls-intrinsics" }

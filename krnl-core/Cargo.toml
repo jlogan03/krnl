@@ -18,7 +18,7 @@ autobenches = false
 
 [dependencies]
 krnl-macros.workspace = true
-spirv-std = { git = "https://github.com/jlogan03/rust-gpu", branch = "jlogan/float-controls-default" }
+spirv-std = { git = "https://github.com/jlogan03/rust-gpu", branch = "jlogan/float-controls-intrinsics" }
 paste.workspace = true
 dry.workspace = true
 
