@@ -768,15 +768,18 @@ fn write_device_source(src_dir: &Path, module_sources: &FxHashMap<String, String
         };
         let mut source = String::new();
         if module_name.is_empty() {
-            source = r#"#![cfg_attr(target_arch = "spirv",
+            #[cfg(feature = "half")]
+            source.push_str("#![cfg_attr(target_arch = \"spirv\", feature(f16))]\n");
+            source.push_str(
+                r#"#![cfg_attr(target_arch = "spirv",
 no_std,
 feature(asm_experimental_arch),
 )]
 
 extern crate krnl_core;
 
-"#
-            .to_string();
+"#,
+            );
         }
         let file_path = dir.join(file_name).with_extension("rs");
         if let Some(children) = tree.get(module) {

@@ -42,6 +42,8 @@ rustup toolchain install nightly-2026-05-22 --profile minimal --component rust-s
 cargo +nightly-2026-05-22 install --path krnlc --locked
 ```
 
+Add `--features half` to enable Rust's primitive `f16` type in GPU kernel modules.
+
 The default build compiles SPIRV-Tools 0.13.3 from source (a C++ compiler is
 required). `--no-default-features --features use-installed-tools` instead uses
 SPIRV-Tools from `PATH`.
