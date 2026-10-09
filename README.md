@@ -54,8 +54,9 @@ Floating-point kernels additionally require `shaderFloatControls2` and the
 per-width properties for subnormal preservation and round-to-nearest/ties-to-even.
 krnl explicitly requests rust-gpu's `rust_math` policy by default, so ordinary
 arithmetic disables reordering and implicit FMA contraction; opt in with
-`#[kernel(fast_math)]` to allow reordering and flush subnormals to zero. Unsupported
-policies are rejected at kernel creation. Rebuild existing caches with this
+`#[kernel(fast_math)]` to allow reordering and flush subnormals to zero.
+Fast math assumes finite operands and results. Unsupported policies are rejected
+at kernel creation. Rebuild existing caches with this
 fork's `krnlc` to pick up the new defaults.
 
 - For development, it's recomended to install the [LunarG Vulkan SDK](https://www.lunarg.com/vulkan-sdk/), which includes additional tools:

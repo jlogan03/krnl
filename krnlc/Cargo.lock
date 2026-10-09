@@ -1199,7 +1199,7 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 [[package]]
 name = "rustc_codegen_spirv"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#a2735491fbe3f4e168fa3b09dcaa4a189dcb45b1"
+source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#04e404cfe035cc358e2fc3729180e29a98959e43"
 dependencies = [
  "ahash",
  "ar",
@@ -1233,7 +1233,7 @@ dependencies = [
 [[package]]
 name = "rustc_codegen_spirv-types"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#a2735491fbe3f4e168fa3b09dcaa4a189dcb45b1"
+source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#04e404cfe035cc358e2fc3729180e29a98959e43"
 dependencies = [
  "rspirv 0.13.0+sdk-1.4.341.0 (git+https://github.com/jlogan03/rspirv?branch=jlogan%2Fexecution-mode-id-args)",
  "semver",
@@ -1453,7 +1453,7 @@ dependencies = [
 [[package]]
 name = "spirv-builder"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#a2735491fbe3f4e168fa3b09dcaa4a189dcb45b1"
+source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#04e404cfe035cc358e2fc3729180e29a98959e43"
 dependencies = [
  "cargo_metadata 0.21.0",
  "log",
@@ -1470,7 +1470,7 @@ dependencies = [
 [[package]]
 name = "spirv-std-types"
 version = "0.10.0-alpha.1"
-source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#a2735491fbe3f4e168fa3b09dcaa4a189dcb45b1"
+source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#04e404cfe035cc358e2fc3729180e29a98959e43"
 
 [[package]]
 name = "spirv-tools"
