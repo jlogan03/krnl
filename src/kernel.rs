@@ -121,19 +121,19 @@ will emit a compiler error.
 To locate [modules](#modules) and compile kernels with
 [spirv-builder](https://docs.rs/crate/spirv-builder), krnlc uses its pinned nightly:
 ```text
-rustup toolchain install nightly-2026-05-22
-rustup component add --toolchain nightly-2026-05-22 rust-src rustc-dev llvm-tools
+rustup toolchain install nightly-2026-08-15
+rustup component add --toolchain nightly-2026-08-15 rust-src rustc-dev llvm-tools
 ```
 
 ## Installing
 With spirv-tools from the [LunarG Vulkan SDK](https://www.lunarg.com/vulkan-sdk/) installed (will save significant compile time):
 ```text
-cargo +nightly-2026-05-22 install --path krnlc --locked --no-default-features \
+cargo +nightly-2026-08-15 install --path krnlc --locked --no-default-features \
  --features use-installed-tools
 ```
 Otherwise:
 ```text
-cargo +nightly-2026-05-22 install --path krnlc --locked
+cargo +nightly-2026-08-15 install --path krnlc --locked
 ```
 
 ## Metadata

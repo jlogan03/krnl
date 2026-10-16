@@ -33,13 +33,13 @@ See the docs for installation and usage instructions.
 # Installing
 
 The host library requires Rust 1.95 or newer. The kernel compiler uses
-`nightly-2026-05-22`. This development fork uses `jlogan03/rust-gpu` from the
+`nightly-2026-08-15`. This development fork uses `jlogan03/rust-gpu` from the
 `jlogan/float-controls-intrinsics` Git branch, pinned by the Cargo lockfiles.
 From this checkout, install it with:
 
 ```sh
-rustup toolchain install nightly-2026-05-22 --profile minimal --component rust-src,rustc-dev,llvm-tools
-cargo +nightly-2026-05-22 install --path krnlc --locked
+rustup toolchain install nightly-2026-08-15 --profile minimal --component rust-src,rustc-dev,llvm-tools
+cargo +nightly-2026-08-15 install --path krnlc --locked
 ```
 
 Add `--features half` to enable Rust's primitive `f16` type in GPU kernel modules.

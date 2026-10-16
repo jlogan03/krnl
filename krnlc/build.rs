@@ -8,11 +8,11 @@ use std::{
     process::Command,
 };
 
-#[rustversion::not(nightly(2026-05-21))]
+#[rustversion::not(nightly(2026-08-14))]
 compile_error!(
-    "krnlc requires nightly-2026-05-22, install with rustup:
-rustup toolchain install nightly-2026-05-22
-rustup component add --toolchain nightly-2026-05-22 rust-src rustc-dev llvm-tools"
+    "krnlc requires nightly-2026-08-15, install with rustup:
+rustup toolchain install nightly-2026-08-15
+rustup component add --toolchain nightly-2026-08-15 rust-src rustc-dev llvm-tools"
 );
 
 fn main() {
@@ -48,7 +48,8 @@ fn main() {
         }
     }
     let out_dir = PathBuf::from(var("OUT_DIR").unwrap());
-    let target_dir = out_dir.ancestors().nth(3).unwrap();
+    // OUT_DIR is <profile>/build/<package>/<hash>/out.
+    let target_dir = out_dir.ancestors().nth(4).unwrap();
     let rustc_codegen_spirv_path =
         target_dir.join(format!("{DLL_PREFIX}rustc_codegen_spirv{DLL_SUFFIX}"));
     println!(
