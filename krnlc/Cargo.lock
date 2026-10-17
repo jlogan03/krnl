@@ -1210,7 +1210,7 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 [[package]]
 name = "rustc_codegen_spirv"
 version = "0.11.0"
-source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#75e61abe3bece5ff52ba025f8b339fc5a10c7b34"
+source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#18e7d247363b7e5a8642b476ecfdca797d899291"
 dependencies = [
  "ahash",
  "ar",
@@ -1244,7 +1244,7 @@ dependencies = [
 [[package]]
 name = "rustc_codegen_spirv-types"
 version = "0.11.0"
-source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#75e61abe3bece5ff52ba025f8b339fc5a10c7b34"
+source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#18e7d247363b7e5a8642b476ecfdca797d899291"
 dependencies = [
  "rspirv 0.13.0+sdk-1.4.341.0 (git+https://github.com/jlogan03/rspirv?branch=jlogan%2Fexecution-mode-id-args)",
  "semver",
@@ -1426,7 +1426,7 @@ dependencies = [
 [[package]]
 name = "spirt"
 version = "0.4.0"
-source = "git+https://github.com/rust-gpu/spirt?branch=eddyb%2Fmisc-flex#64d7eb37ad1fda1d81ef0cb39fb84ec73a286902"
+source = "git+https://github.com/LykenSol/spirt?branch=bypass-merge-blocks#4b5f5293ba24733240afa3918a584ac10060ff89"
 dependencies = [
  "arrayvec",
  "bytemuck",
@@ -1464,7 +1464,7 @@ dependencies = [
 [[package]]
 name = "spirv-builder"
 version = "0.11.0"
-source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#75e61abe3bece5ff52ba025f8b339fc5a10c7b34"
+source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#18e7d247363b7e5a8642b476ecfdca797d899291"
 dependencies = [
  "cargo_metadata 0.21.0",
  "log",
@@ -1481,7 +1481,7 @@ dependencies = [
 [[package]]
 name = "spirv-std-types"
 version = "0.11.0"
-source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#75e61abe3bece5ff52ba025f8b339fc5a10c7b34"
+source = "git+https://github.com/jlogan03/rust-gpu?branch=jlogan%2Ffloat-controls-intrinsics#18e7d247363b7e5a8642b476ecfdca797d899291"
 
 [[package]]
 name = "spirv-tools"
