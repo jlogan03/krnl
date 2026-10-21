@@ -218,13 +218,12 @@ impl ToTokens for ModuleItem {
 
 #[proc_macro_attribute]
 pub fn kernel(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let fast_math = attr.to_string() == "fast_math";
-    if !attr.is_empty() && !fast_math {
+    if !attr.is_empty() {
         return Error::new_spanned(TokenStream2::from(attr), "unexpected tokens")
             .into_compile_error()
             .into();
     }
-    match kernel_impl(item.into(), fast_math) {
+    match kernel_impl(item.into()) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.into_compile_error().into(),
     }
@@ -1382,12 +1381,7 @@ impl ToTokens for PushDesc {
     }
 }
 
-fn kernel_impl(item_tokens: TokenStream2, fast_math: bool) -> Result<TokenStream2> {
-    let float_policy = if fast_math {
-        quote!(, fast_math)
-    } else {
-        quote!(, rust_math)
-    };
+fn kernel_impl(item_tokens: TokenStream2) -> Result<TokenStream2> {
     let item: KernelItem = syn::parse2(item_tokens.clone())?;
     let kernel_meta = item.meta()?;
     let kernel_desc = kernel_meta.desc()?;
@@ -1462,7 +1456,7 @@ fn kernel_impl(item_tokens: TokenStream2, fast_math: bool) -> Result<TokenStream
         quote! {
             #push_struct_tokens
             #[cfg(target_arch = "spirv")]
-            #[::krnl_core::spirv_std::spirv(compute(threads(1) #float_policy))]
+            #[::krnl_core::spirv_std::spirv(compute(threads(1), rust_math))]
             #[allow(unused)]
             pub fn #ident(
                 #push_consts_arg

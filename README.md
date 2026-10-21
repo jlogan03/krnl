@@ -50,14 +50,18 @@ SPIRV-Tools from `PATH`.
 
 For device functionality (kernels), install [Vulkan](https://www.vulkan.org) for your platform.
 
-Floating-point kernels additionally require `shaderFloatControls2` and the
-per-width properties for subnormal preservation and round-to-nearest/ties-to-even.
-krnl explicitly requests rust-gpu's `rust_math` policy by default, so ordinary
-arithmetic disables reordering and implicit FMA contraction; opt in with
-`#[kernel(fast_math)]` to allow reordering and flush subnormals to zero.
-Fast math assumes finite operands and results. Unsupported policies are rejected
-at kernel creation. Rebuild existing caches with this
-fork's `krnlc` to pick up the new defaults.
+Kernels compile with rust-gpu's `rust_math` policy. Ordinary arithmetic preserves
+signed zero, NaN, and infinity and disables reassociation and implicit FMA
+contraction. Explicit `algebraic_*` operations retain their relaxed semantics.
+
+On macOS, krnl keeps the supported rounding and subnormal modes and uses device
+defaults for unsupported modes, including any coupled float widths. Other
+platforms require subnormal preservation and round-to-nearest/ties-to-even.
+All platforms require `shaderFloatControls2` and the special-value preservation
+properties. Numerical schemes that depend on subnormal residuals need testing
+on each target device.
+
+Kernel attributes do not expose math policies.
 
 - For development, it's recomended to install the [LunarG Vulkan SDK](https://www.lunarg.com/vulkan-sdk/), which includes additional tools:
   - vulkaninfo

@@ -1211,6 +1211,7 @@ fn prepare_float_controls(device: &Device, desc: &KernelDesc) -> Result<Vec<u32>
         &desc.name,
         device.enabled_features().shader_float_controls2,
         device.physical_device().properties(),
+        cfg!(target_os = "macos"),
     )
 }
 
@@ -1219,6 +1220,7 @@ fn prepare_float_controls_with_properties(
     kernel_name: &str,
     controls2: bool,
     properties: &vulkano::device::DeviceProperties,
+    macos: bool,
 ) -> Result<Vec<u32>> {
     use rspirv::spirv::{Capability, ExecutionMode, Op};
     use rspirv::{
@@ -1266,9 +1268,8 @@ fn prepare_float_controls_with_properties(
             );
         }
     }
-    // Restricted independence requires matching modes even for widths unused
-    // by this kernel. Complete those modes per device, without adding types or
-    // relaxing the arithmetic policy. Pipeline validation checks their support.
+    // Restricted independence requires matching modes even for unused widths.
+    // Add companion modes before checking support for the whole group.
     for (independence, candidates) in [
         (
             properties.denorm_behavior_independence,
@@ -1319,6 +1320,7 @@ fn prepare_float_controls_with_properties(
             }
         }
     }
+    let mut unsupported = Vec::new();
     for inst in &module.execution_modes {
         let mode = inst.operands[1].unwrap_execution_mode();
         if !matches!(
@@ -1359,8 +1361,48 @@ fn prepare_float_controls_with_properties(
             _ => rtz,
         };
         if supported != Some(true) {
-            anyhow::bail!("kernel `{kernel_name}` requires {mode:?} for f{width}, which this device does not support");
+            if !macos {
+                anyhow::bail!("kernel `{kernel_name}` requires {mode:?} for f{width}, which this device does not support");
+            }
+            unsupported.push((mode, width));
         }
+    }
+    // On macOS, use device defaults where explicit modes are unsupported.
+    // Remove coupled modes together; keep the fast-math restrictions intact.
+    module.execution_modes.retain(|inst| {
+        let mode = inst.operands[1].unwrap_execution_mode();
+        !unsupported.iter().any(|&(unsupported_mode, width)| {
+            if mode != unsupported_mode {
+                return false;
+            }
+            let independence = match mode {
+                ExecutionMode::DenormPreserve | ExecutionMode::DenormFlushToZero => {
+                    properties.denorm_behavior_independence
+                }
+                _ => properties.rounding_mode_independence,
+            };
+            let other_width = inst.operands[2].unwrap_literal_bit32();
+            width == other_width
+                || independence == Some(ShaderFloatControlsIndependence::None)
+                || (independence == Some(ShaderFloatControlsIndependence::Float32Only)
+                    && width != 32
+                    && other_width != 32)
+        })
+    });
+    if macos {
+        module.capabilities.retain(|inst| {
+            let mode = match inst.operands[0].unwrap_capability() {
+                Capability::DenormPreserve => ExecutionMode::DenormPreserve,
+                Capability::DenormFlushToZero => ExecutionMode::DenormFlushToZero,
+                Capability::RoundingModeRTE => ExecutionMode::RoundingModeRTE,
+                Capability::RoundingModeRTZ => ExecutionMode::RoundingModeRTZ,
+                _ => return true,
+            };
+            module
+                .execution_modes
+                .iter()
+                .any(|inst| inst.operands[1].unwrap_execution_mode() == mode)
+        });
     }
     // Vulkano also validates these modes and mixed-width independence.
     Ok(module.assemble())
@@ -1440,9 +1482,9 @@ mod float_control_tests {
     };
     use vulkano::device::{physical::ShaderFloatControlsIndependence, DeviceProperties};
 
-    fn shader(mode: ExecutionMode) -> Vec<u32> {
+    fn shader(mode: ExecutionMode, width: u32) -> Vec<u32> {
         let mut builder = Builder::new();
-        let float = builder.type_float(64, None);
+        let float = builder.type_float(width, None);
         let uint = builder.type_int(32, 0);
         let flags = builder.constant_bit32(uint, 0);
         let entry = builder.id();
@@ -1459,8 +1501,13 @@ mod float_control_tests {
                 Operand::IdRef(flags),
             ],
         ));
-        builder.execution_mode(entry, mode, [64]);
-        builder.execution_mode(entry, ExecutionMode::RoundingModeRTE, [64]);
+        builder.capability(match mode {
+            ExecutionMode::DenormPreserve => Capability::DenormPreserve,
+            _ => Capability::DenormFlushToZero,
+        });
+        builder.capability(Capability::RoundingModeRTE);
+        builder.execution_mode(entry, mode, [width]);
+        builder.execution_mode(entry, ExecutionMode::RoundingModeRTE, [width]);
         builder.module().assemble()
     }
 
@@ -1480,23 +1527,106 @@ mod float_control_tests {
     #[test]
     fn rejects_unsupported_policies() {
         let props = properties();
-        let strict = shader(ExecutionMode::DenormPreserve);
-        let error =
-            prepare_float_controls_with_properties(&strict, "strict", false, &props).unwrap_err();
+        let strict = shader(ExecutionMode::DenormPreserve, 64);
+        let error = prepare_float_controls_with_properties(&strict, "strict", false, &props, false)
+            .unwrap_err();
         assert!(error.to_string().contains("shaderFloatControls2"));
-        let fast = shader(ExecutionMode::DenormFlushToZero);
+        let fast = shader(ExecutionMode::DenormFlushToZero, 64);
         let error =
-            prepare_float_controls_with_properties(&fast, "fast", true, &props).unwrap_err();
+            prepare_float_controls_with_properties(&fast, "fast", true, &props, false).unwrap_err();
         assert!(error.to_string().contains("DenormFlushToZero"));
+    }
+
+    #[test]
+    fn macos_keeps_arithmetic_restrictions_without_unsupported_modes() {
+        let shader = shader(ExecutionMode::DenormPreserve, 32);
+        // MoltenVK 1.4.2 supports RTE for f16/f32, but couples all widths and
+        // does not support f64 RTE or either explicit subnormal mode.
+        let props = DeviceProperties {
+            shader_signed_zero_inf_nan_preserve_float32: Some(true),
+            shader_rounding_mode_rte_float16: Some(true),
+            shader_rounding_mode_rte_float32: Some(true),
+            denorm_behavior_independence: Some(ShaderFloatControlsIndependence::None),
+            rounding_mode_independence: Some(ShaderFloatControlsIndependence::None),
+            ..Default::default()
+        };
+        assert!(
+            prepare_float_controls_with_properties(&shader, "strict", true, &props, false).is_err()
+        );
+        let words =
+            prepare_float_controls_with_properties(&shader, "strict", true, &props, true).unwrap();
+        let module = crate::spirv::load_words(words).unwrap();
+        let original = crate::spirv::load_words(&shader).unwrap();
+        assert_eq!(
+            module.execution_modes,
+            original
+                .execution_modes
+                .into_iter()
+                .filter(|inst| inst.operands[1]
+                    == Operand::ExecutionMode(ExecutionMode::FPFastMathDefault))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(module.types_global_values, original.types_global_values);
+        assert_eq!(module.capabilities.len(), 1);
+        assert_eq!(
+            module.capabilities[0].operands[0],
+            Operand::Capability(Capability::FloatControls2)
+        );
+        // macOS must still support the restrictions on arithmetic and special values.
+        assert!(
+            prepare_float_controls_with_properties(&shader, "strict", false, &props, true).is_err()
+        );
+        let props = DeviceProperties {
+            shader_signed_zero_inf_nan_preserve_float32: Some(false),
+            ..props
+        };
+        assert!(
+            prepare_float_controls_with_properties(&shader, "strict", true, &props, true).is_err()
+        );
+    }
+
+    #[test]
+    fn macos_retains_supported_modes() {
+        let shader = shader(ExecutionMode::DenormPreserve, 64);
+        let props = properties();
+        let strict =
+            prepare_float_controls_with_properties(&shader, "strict", true, &props, false).unwrap();
+        assert_eq!(
+            prepare_float_controls_with_properties(&shader, "strict", true, &props, true).unwrap(),
+            strict
+        );
+        let props = DeviceProperties {
+            shader_denorm_preserve_float16: Some(false),
+            ..props
+        };
+        let words =
+            prepare_float_controls_with_properties(&shader, "strict", true, &props, true).unwrap();
+        let module = crate::spirv::load_words(words).unwrap();
+        // Unsupported f16 preservation also removes the coupled f64 mode,
+        // without dropping the supported rounding modes.
+        assert!(!module
+            .execution_modes
+            .iter()
+            .any(|inst| inst.operands[1] == Operand::ExecutionMode(ExecutionMode::DenormPreserve)));
+        assert_eq!(
+            module
+                .execution_modes
+                .iter()
+                .filter(|inst| inst.operands[1]
+                    == Operand::ExecutionMode(ExecutionMode::RoundingModeRTE))
+                .count(),
+            2
+        );
     }
 
     #[test]
     fn completes_companion_modes_without_adding_float_types() {
         let words = prepare_float_controls_with_properties(
-            &shader(ExecutionMode::DenormPreserve),
+            &shader(ExecutionMode::DenormPreserve, 64),
             "strict",
             true,
             &properties(),
+            false,
         )
         .unwrap();
         let module = crate::spirv::load_words(words).unwrap();

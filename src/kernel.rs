@@ -81,19 +81,22 @@ fn main() -> Result<()> {
 
 ## Floating-point behavior
 
-Ordinary floating-point arithmetic in device kernels preserves subnormals and
-uses round-to-nearest/ties-to-even, without reassociation or implicit FMA
-contraction. `#[kernel(fast_math)]` allows reassociation, contraction, reciprocal
-transformations and ignoring signed zero, and flushes subnormals to zero.
-Neither policy assumes inputs cannot be NaN or infinity. Explicit Rust
-`algebraic_*` operations allow reordering under either policy, while `mul_add`
-remains explicitly fused.
+Device kernels compile with `rust_math`. Ordinary arithmetic preserves signed
+zero, NaN, and infinity and disallows reassociation and implicit FMA contraction.
+Explicit Rust `algebraic_*` operations allow reordering, while `mul_add` remains
+explicitly fused. Kernel attributes do not expose math policies.
 
-These policies require Vulkan `shaderFloatControls2` and the appropriate
-per-width floating-point properties. Unsupported policies return an error when
-building a kernel; they are never silently relaxed. This does not guarantee full
-IEEE-754 accuracy for division or transcendental functions. Recompile existing
-kernel caches with this fork's `krnlc` to use the new defaults.
+On macOS, krnl uses device defaults for unsupported rounding and subnormal modes.
+If a device couples float widths, krnl omits the mode for the whole affected
+group. Supported modes and arithmetic restrictions remain enabled. Other
+platforms require subnormal preservation and round-to-nearest/ties-to-even.
+
+All platforms require Vulkan `shaderFloatControls2` and the per-width properties
+for signed-zero, infinity, and NaN preservation. Missing support returns an error
+when building a kernel. This does not guarantee full IEEE-754 accuracy for division
+or transcendental functions. Test numerical schemes on each target device,
+especially those that depend on subnormal residuals. Replace
+`#[kernel(fast_math)]` with `#[kernel]` and regenerate existing kernel caches.
 
 ## Compilation
 [Kernels](#kernels) are compiled with krnlc.
