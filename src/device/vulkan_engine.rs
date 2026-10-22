@@ -51,6 +51,21 @@ use vulkano::{
     VulkanObject,
 };
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct MoltenVkLoader;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// MoltenVK is linked for the process lifetime and provides the Vulkan C ABI.
+unsafe impl vulkano::library::Loader for MoltenVkLoader {
+    unsafe fn get_instance_proc_addr(
+        &self,
+        instance: ash::vk::Instance,
+        name: *const std::ffi::c_char,
+    ) -> ash::vk::PFN_vkVoidFunction {
+        unsafe { moltenvk_static::vkGetInstanceProcAddr(instance.as_raw() as *mut _, name) }
+    }
+}
+
 pub struct Engine {
     info: Arc<DeviceInfo>,
     semaphore: Arc<Semaphore>,
@@ -158,7 +173,11 @@ impl DeviceEngine for Engine {
             index,
             optimal_features,
         } = options;
-        let library = VulkanLibrary::new().map_err(|e| Error::new(DeviceUnavailable).context(e))?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let library = VulkanLibrary::with_loader(MoltenVkLoader);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let library = VulkanLibrary::new();
+        let library = library.map_err(|e| Error::new(DeviceUnavailable).context(e))?;
         let debug_printf = Arc::new(AtomicBool::default());
         let debug_printf2 = debug_printf.clone();
         let debug_create_info = DebugUtilsMessengerCreateInfo {

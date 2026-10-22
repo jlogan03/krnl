@@ -3,11 +3,13 @@ on:
   push:
     branches:
       - main
+      - jlogan/update-deps
     paths-ignore:
       - "**.md"
   pull_request:
     paths-ignore:
       - "**.md"
+  workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
@@ -30,7 +32,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
@@ -70,6 +72,23 @@ jobs:
         env:
           RUSTFLAGS: --cfg run_in_browser
         continue-on-error: ${{ runner.os == 'macOS' }}
+  macos-device:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: krnl
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: test on MoltenVK
+        run: cargo +stable test -p krnl --features serde,moltenvk-static/build-moltenvk --lib --test integration_tests -- --test-threads=1
   krnlc:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -81,7 +100,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
           # - os: windows-latest
           #   target: x86_64-pc-windows-msvc
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4

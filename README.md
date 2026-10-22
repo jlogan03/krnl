@@ -48,7 +48,17 @@ The default build compiles SPIRV-Tools 0.13.3 from source (a C++ compiler is
 required). `--no-default-features --features use-installed-tools` instead uses
 SPIRV-Tools from `PATH`.
 
-For device functionality (kernels), install [Vulkan](https://www.vulkan.org) for your platform.
+For device functionality (kernels), install [Vulkan](https://www.vulkan.org) for your
+platform, except on ARM64 macOS.
+
+On ARM64 macOS 12 or later, krnl links MoltenVK statically via
+`moltenvk-static` as a Vulkan-to-Metal adapter.
+
+Run the macOS device tests from this checkout with:
+
+```sh
+cargo test -p krnl --features moltenvk-static/build-moltenvk --lib --test integration_tests -- --test-threads=1
+```
 
 Kernels compile with rust-gpu's `rust_math` policy. Ordinary arithmetic preserves
 signed zero, NaN, and infinity and disables reassociation and implicit FMA
