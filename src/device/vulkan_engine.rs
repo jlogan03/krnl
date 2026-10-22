@@ -6,7 +6,7 @@ use super::{
 
 use anyhow::{Error, Result};
 use ash::vk::Handle;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::{
@@ -16,6 +16,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    time::Duration,
 };
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -47,7 +48,7 @@ use vulkano::{
     },
     pipeline::{ComputePipeline, Pipeline, PipelineBindPoint},
     shader::{ShaderModule, ShaderStages},
-    sync::semaphore::Semaphore,
+    sync::{semaphore::Semaphore, AccessFlags, DependencyInfo, MemoryBarrier, PipelineStages},
     VulkanObject,
 };
 
@@ -83,6 +84,10 @@ pub struct Engine {
 }
 
 impl Engine {
+    fn host_buffer(&self) -> Result<HostBuffer, DeviceLost> {
+        HostBuffer::recv(&self.host_buffer_receiver, &self.worker_exited)
+            .ok_or_else(|| DeviceLost(self.id()))
+    }
     unsafe fn transfer(
         &self,
         src: Subbuffer<[u8]>,
@@ -513,6 +518,40 @@ struct HostBuffer {
     epoch: u64,
 }
 
+impl HostBuffer {
+    fn recv(receiver: &Receiver<Self>, worker_exited: &AtomicBool) -> Option<Self> {
+        while !worker_exited.load(Ordering::SeqCst) {
+            match receiver.recv_timeout(Duration::from_millis(10)) {
+                Ok(buffer) => return Some(buffer),
+                Err(RecvTimeoutError::Timeout) => (),
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        None
+    }
+}
+
+#[test]
+fn host_buffer_wait_stops_when_worker_exits() {
+    // Keep the pool connected but empty, as after both staging buffers are lost.
+    let (_sender, receiver) = crossbeam_channel::bounded(2);
+    let worker_exited = Arc::new(AtomicBool::new(false));
+    let worker_exited2 = worker_exited.clone();
+    let (done_sender, done_receiver) = crossbeam_channel::bounded(1);
+    let waiter = std::thread::spawn(move || {
+        done_sender
+            .send(HostBuffer::recv(&receiver, &worker_exited2).is_none())
+            .unwrap();
+    });
+    assert_eq!(
+        done_receiver.recv_timeout(Duration::from_millis(20)),
+        Err(RecvTimeoutError::Timeout)
+    );
+    worker_exited.store(true, Ordering::SeqCst);
+    assert!(done_receiver.recv_timeout(Duration::from_secs(1)).unwrap());
+    waiter.join().unwrap();
+}
+
 impl Drop for HostBuffer {
     fn drop(&mut self) {
         let result = self.queue.with(|mut x| x.wait_idle());
@@ -675,6 +714,7 @@ impl Frame {
         if let Some(dst_device_buffer) = dst_device_buffer {
             dst_device_buffer.epoch.store(self.epoch, Ordering::SeqCst);
         }
+        unsafe { self.memory_barrier() };
     }
     unsafe fn compute(
         &mut self,
@@ -736,14 +776,36 @@ impl Frame {
         }
         self.buffers
             .extend(buffers.iter().map(|x| x.inner.as_ref().unwrap().clone()));
-        for (buffer, slice_desc) in buffers.iter().zip(kernel_desc.slice_descs.iter()) {
-            if slice_desc.mutable {
-                buffer.epoch.store(self.epoch, Ordering::SeqCst);
-            }
+        // Host writes must also wait for kernels that only read the buffer.
+        for buffer in buffers {
+            buffer.epoch.store(self.epoch, Ordering::SeqCst);
         }
         if let Some(debug_printf_panic) = debug_printf_panic {
             self.debug_kernel_desc_panic
                 .replace((kernel_desc.clone(), debug_printf_panic));
+        }
+        unsafe { self.memory_barrier() };
+    }
+    unsafe fn memory_barrier(&mut self) {
+        // Make writes visible to later copies, kernels, and host reads.
+        let stages = PipelineStages::ALL_TRANSFER | PipelineStages::COMPUTE_SHADER;
+        unsafe {
+            self.command_buffer_builder
+                .as_mut()
+                .unwrap()
+                .pipeline_barrier(&DependencyInfo {
+                    memory_barriers: [MemoryBarrier {
+                        src_stages: stages,
+                        src_access: AccessFlags::MEMORY_WRITE,
+                        dst_stages: stages | PipelineStages::HOST,
+                        dst_access: AccessFlags::MEMORY_READ | AccessFlags::MEMORY_WRITE,
+                        ..Default::default()
+                    }]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                })
+                .unwrap();
         }
     }
     unsafe fn finish(&mut self) {
@@ -1022,7 +1084,7 @@ impl DeviceEngineBuffer for DeviceBuffer {
         }
         let mut offset = 0;
         for chunk in data.chunks(Self::HOST_BUFFER_SIZE) {
-            let mut host_buffer = engine.host_buffer_receiver.recv().unwrap();
+            let mut host_buffer = engine.host_buffer()?;
             let size = chunk.len() as u64;
             let buffer_slice = buffer.clone().slice(offset..offset + size);
             let host_slice = host_buffer.inner.clone().slice(0..size);
@@ -1066,7 +1128,7 @@ impl DeviceEngineBuffer for DeviceBuffer {
         for chunk in data.chunks_mut(Self::HOST_BUFFER_SIZE).chain([[].as_mut()]) {
             let prev_host_copy = host_copy.take();
             if !chunk.is_empty() {
-                let mut host_buffer = engine.host_buffer_receiver.recv().unwrap();
+                let mut host_buffer = engine.host_buffer()?;
                 engine.wait_epoch(host_buffer.epoch)?;
                 let size = chunk.len() as u64;
                 let buffer_slice = buffer.clone().slice(offset..offset + size);
@@ -1146,7 +1208,7 @@ impl DeviceEngineBuffer for DeviceBuffer {
                 .min(Self::HOST_BUFFER_SIZE as u64);
             let prev_host_copy = host_copy.take();
             if size > 0 {
-                let mut host_buffer1 = engine1.host_buffer_receiver.recv().unwrap();
+                let mut host_buffer1 = engine1.host_buffer()?;
                 let buffer_slice1 = buffer1.clone().slice(offset..offset + size);
                 let host_slice1 = host_buffer1.inner.clone().slice(0..size);
                 engine1.wait_epoch(host_buffer1.epoch)?;
@@ -1174,7 +1236,7 @@ impl DeviceEngineBuffer for DeviceBuffer {
                     buffer_slice2,
                 } = prev_host_copy;
                 let size = buffer_slice2.size();
-                let mut host_buffer2 = engine2.host_buffer_receiver.recv().unwrap();
+                let mut host_buffer2 = engine2.host_buffer()?;
                 let host_slice2 = host_buffer2.inner.clone().slice(0..size);
                 engine1.wait_epoch(host_buffer1.epoch)?;
                 engine2.wait_epoch(host_buffer2.epoch)?;
