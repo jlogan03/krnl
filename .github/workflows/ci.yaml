@@ -3,7 +3,6 @@ on:
   push:
     branches:
       - main
-      - jlogan/update-deps
     paths-ignore:
       - "**.md"
   pull_request:

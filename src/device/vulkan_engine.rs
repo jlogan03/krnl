@@ -145,7 +145,7 @@ impl Engine {
     }
     fn wait_epoch(&self, epoch: u64) -> Result<(), DeviceLost> {
         loop {
-            let result = unsafe { wait_semaphore(self.queue.device(), &self.semaphore, epoch) };
+            let result = unsafe { poll_semaphore(self.queue.device(), &self.semaphore, epoch) };
             match result {
                 ash::vk::Result::SUCCESS => return Ok(()),
                 ash::vk::Result::TIMEOUT => (),
@@ -503,13 +503,21 @@ unsafe fn queue_submit(
     Ok(())
 }
 
-unsafe fn wait_semaphore(device: &Device, semaphore: &Semaphore, value: u64) -> ash::vk::Result {
-    let semaphores = &[semaphore.handle()];
-    let values = &[value];
-    let semaphore_wait_info = ash::vk::SemaphoreWaitInfo::default()
-        .semaphores(semaphores)
-        .values(values);
-    unsafe { (device.fns().v1_2.wait_semaphores)(device.handle(), &semaphore_wait_info, 0) }
+unsafe fn poll_semaphore(device: &Device, semaphore: &Semaphore, value: u64) -> ash::vk::Result {
+    // Read the counter directly; zero-timeout waits register callbacks in MoltenVK.
+    let mut completed = 0;
+    let result = unsafe {
+        (device.fns().v1_2.get_semaphore_counter_value)(
+            device.handle(),
+            semaphore.handle(),
+            &mut completed,
+        )
+    };
+    if result == ash::vk::Result::SUCCESS && completed < value {
+        ash::vk::Result::TIMEOUT
+    } else {
+        result
+    }
 }
 
 struct HostBuffer {
@@ -931,7 +939,7 @@ impl Worker {
             });
             loop {
                 let result = unsafe {
-                    wait_semaphore(
+                    poll_semaphore(
                         self.queue.device(),
                         &self.semaphore,
                         self.pending_frame.epoch,

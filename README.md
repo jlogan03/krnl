@@ -54,6 +54,9 @@ platform, except on ARM64 macOS.
 On ARM64 macOS 12 or later, krnl links MoltenVK statically via
 `moltenvk-static` as a Vulkan-to-Metal adapter.
 
+Plan to replace MoltenVK with [KosmicKrisp](https://www.lunarg.com/products/kosmickrisp/)
+once its runtime is easier for users to install. This would require macOS 26 or later.
+
 Run the macOS device tests from this checkout with:
 
 ```sh
