@@ -23,16 +23,58 @@ Developed for [autograph](https://github.com/charles-r-earp/autograph).
 
 Kernel compiler for krnl.
 
-- Built on [spirv-builder](https://github.com/EmbarkStudios/rust-gpu/tree/main/crates/spirv-builder).
+- Built on [spirv-builder](https://github.com/Rust-GPU/rust-gpu/tree/main/crates/spirv-builder).
 - Supports dependencies defined in Cargo.toml.
-- Uses [spirv-tools](https://github.com/EmbarkStudios/spirv-tools-rs) to validate and optimize.
+- Uses [spirv-tools](https://docs.rs/spirv-tools) to validate and optimize.
 - Compiles to "krnl-cache.rs", so the crate will build on stable Rust.
 
 See the docs for installation and usage instructions.
 
 # Installing
 
-For device functionality (kernels), install [Vulkan](https://www.vulkan.org) for your platform.
+The host library requires Rust 1.95 or newer. The kernel compiler uses
+`nightly-2026-08-15`. This development fork uses `jlogan03/rust-gpu` from the
+`jlogan/float-controls-intrinsics` Git branch, pinned by the Cargo lockfiles.
+From this checkout, install it with:
+
+```sh
+rustup toolchain install nightly-2026-08-15 --profile minimal --component rust-src,rustc-dev,llvm-tools
+cargo +nightly-2026-08-15 install --path krnlc --locked
+```
+
+Add `--features half` to enable Rust's primitive `f16` type in GPU kernel modules.
+
+The default build compiles SPIRV-Tools 0.13.3 from source (a C++ compiler is
+required). `--no-default-features --features use-installed-tools` instead uses
+SPIRV-Tools from `PATH`.
+
+For device functionality (kernels), install [Vulkan](https://www.vulkan.org) for your
+platform, except on ARM64 macOS.
+
+On ARM64 macOS 12 or later, krnl links MoltenVK statically via
+`moltenvk-static` as a Vulkan-to-Metal adapter.
+
+Plan to replace MoltenVK with [KosmicKrisp](https://www.lunarg.com/products/kosmickrisp/)
+once its runtime is easier for users to install. This would require macOS 26 or later.
+
+Run the macOS device tests from this checkout with:
+
+```sh
+cargo test -p krnl --features moltenvk-static/build-moltenvk --lib --test integration_tests -- --test-threads=1
+```
+
+Kernels compile with rust-gpu's `rust_math` policy. Ordinary arithmetic preserves
+signed zero, NaN, and infinity and disables reassociation and implicit FMA
+contraction. Explicit `algebraic_*` operations retain their relaxed semantics.
+
+On macOS, krnl keeps the supported rounding and subnormal modes and uses device
+defaults for unsupported modes, including any coupled float widths. Other
+platforms require subnormal preservation and round-to-nearest/ties-to-even.
+All platforms require `shaderFloatControls2` and the special-value preservation
+properties. Numerical schemes that depend on subnormal residuals need testing
+on each target device.
+
+Kernel attributes do not expose math policies.
 
 - For development, it's recomended to install the [LunarG Vulkan SDK](https://www.lunarg.com/vulkan-sdk/), which includes additional tools:
   - vulkaninfo

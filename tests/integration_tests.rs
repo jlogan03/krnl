@@ -187,8 +187,8 @@ fn buffer_from_vec(device: Device) {
             .unwrap();
         assert_eq!(y.len(), n);
         if x != y.as_slice() {
-            for (x, y) in x.iter().zip(y) {
-                assert_eq!(&y, x);
+            for (i, (x, y)) in x.iter().zip(y).enumerate() {
+                assert_eq!(&y, x, "i: {i}, n: {n}");
             }
         }
     }
@@ -237,8 +237,8 @@ fn buffer_fill<T: Scalar>(device: Device) {
         let mut y = Slice::from(x).to_device(device.clone()).unwrap();
         y.fill(elem).unwrap();
         let y: Vec<T> = y.into_vec().unwrap();
-        for y in y.into_iter() {
-            assert_eq!(y, elem);
+        for (i, y) in y.into_iter().enumerate() {
+            assert_eq!(y, elem, "i: {i}, n: {n}");
         }
     }
 }
@@ -259,8 +259,8 @@ fn buffer_cast<X: Scalar, Y: Scalar>(device: Device) {
             .unwrap()
             .into_vec()
             .unwrap();
-        for (x, y) in x.iter().zip(y.iter()) {
-            assert_eq!(*y, x.cast::<Y>());
+        for (i, (x, y)) in x.iter().zip(y.iter()).enumerate() {
+            assert_eq!(*y, x.cast::<Y>(), "i: {i}, n: {n}");
         }
     }
 }

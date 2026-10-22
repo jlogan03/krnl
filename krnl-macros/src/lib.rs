@@ -1456,7 +1456,7 @@ fn kernel_impl(item_tokens: TokenStream2) -> Result<TokenStream2> {
         quote! {
             #push_struct_tokens
             #[cfg(target_arch = "spirv")]
-            #[::krnl_core::spirv_std::spirv(compute(threads(1)))]
+            #[::krnl_core::spirv_std::spirv(compute(threads(1), rust_math))]
             #[allow(unused)]
             pub fn #ident(
                 #push_consts_arg

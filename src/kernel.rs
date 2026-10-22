@@ -78,6 +78,27 @@ fn main() -> Result<()> {
 ```
 
 # krnlc
+
+## Floating-point behavior
+
+Device kernels compile with `rust_math`. Ordinary arithmetic preserves signed
+zero, NaN, and infinity and disallows reassociation and implicit FMA contraction.
+Explicit Rust `algebraic_*` operations allow reordering, while `mul_add` remains
+explicitly fused. Kernel attributes do not expose math policies.
+
+On macOS, krnl uses device defaults for unsupported rounding and subnormal modes.
+If a device couples float widths, krnl omits the mode for the whole affected
+group. Supported modes and arithmetic restrictions remain enabled. Other
+platforms require subnormal preservation and round-to-nearest/ties-to-even.
+
+All platforms require Vulkan `shaderFloatControls2` and the per-width properties
+for signed-zero, infinity, and NaN preservation. Missing support returns an error
+when building a kernel. This does not guarantee full IEEE-754 accuracy for division
+or transcendental functions. Test numerical schemes on each target device,
+especially those that depend on subnormal residuals. Replace
+`#[kernel(fast_math)]` with `#[kernel]` and regenerate existing kernel caches.
+
+## Compilation
 [Kernels](#kernels) are compiled with krnlc.
 
 Compile with `krnlc` or `krnlc -p my-crate`.
@@ -100,25 +121,22 @@ If the version of krnlc is incompatible with the krnl version, [`module`](#modul
 will emit a compiler error.
 
 ## Toolchains
-To locate [modules](#modules), krnlc will use the nightly toolchain. Install it with:
+To locate [modules](#modules) and compile kernels with
+[spirv-builder](https://docs.rs/crate/spirv-builder), krnlc uses its pinned nightly:
 ```text
-rustup toolchain install nightly
-```
-To compile kernels with [spirv-builder](https://docs.rs/crate/spirv-builder), a specific nightly is required:
-```text
-rustup toolchain install nightly-2023-05-27
-rustup component add --toolchain nightly-2023-05-27 rust-src rustc-dev llvm-tools-preview
+rustup toolchain install nightly-2026-08-15
+rustup component add --toolchain nightly-2026-08-15 rust-src rustc-dev llvm-tools
 ```
 
 ## Installing
 With spirv-tools from the [LunarG Vulkan SDK](https://www.lunarg.com/vulkan-sdk/) installed (will save significant compile time):
 ```text
-cargo +nightly-2023-05-27 install krnlc --locked --no-default-features \
+cargo +nightly-2026-08-15 install --path krnlc --locked --no-default-features \
  --features use-installed-tools
 ```
 Otherwise:
 ```text
-cargo +nightly-2023-05-27 install krnlc --locked
+cargo +nightly-2026-08-15 install --path krnlc --locked
 ```
 
 ## Metadata
@@ -479,10 +497,10 @@ to and from devices. [`Device::wait()`](crate::device::Device::wait) can be used
 [Binary intermediate representation](https://www.khronos.org/spir) for graphics shaders that can be used with [Vulkan](https://www.vulkan.org).
 [Kernels](#Kernels) are implemented as compute shaders targeting Vulkan 1.2.
 
-[spirv-std](krnl_core::spirv_std) is a std library for the spirv arch, for use with [rust-gpu](https://github.com/EmbarkStudios/rust-gpu).
+[spirv-std](krnl_core::spirv_std) is a std library for the spirv arch, for use with [rust-gpu](https://github.com/Rust-GPU/rust-gpu).
 
 ## Asm
-The [`asm!`](core::arch::asm) macro can be used with the spirv arch, see [inline-asm](https://github.com/EmbarkStudios/rust-gpu/blob/v0.9.0/docs/src/inline-asm.md).
+The [`asm!`](core::arch::asm) macro can be used with the spirv arch, see [inline-asm](https://github.com/Rust-GPU/rust-gpu/blob/main/docs/src/inline-asm.md).
 
 # DebugPrintf
 [debug_printf!](krnl_core::spirv_std::macros::debug_printfln) and [debug_printfln!](krnl_core::spirv_std::macros::debug_printfln)
@@ -599,7 +617,7 @@ impl KernelDesc {
         debug_printf: bool,
     ) -> Result<Self> {
         use rspirv::spirv::{Decoration, Op};
-        let mut module = rspirv::dr::load_words(&self.spirv).unwrap();
+        let mut module = crate::spirv::load_words(&self.spirv)?;
         let mut spec_ids = HashMap::<u32, u32>::with_capacity(spec_consts.len());
         let mut spec_string = format!("threads={threads}");
         use std::fmt::Write;
@@ -622,7 +640,7 @@ impl KernelDesc {
         };
         for inst in module.annotations.iter() {
             if inst.class.opcode == Op::Decorate {
-                if let [Operand::IdRef(id), Operand::Decoration(Decoration::SpecId), Operand::LiteralInt32(spec_id)] =
+                if let [Operand::IdRef(id), Operand::Decoration(Decoration::SpecId), Operand::LiteralBit32(spec_id)] =
                     inst.operands.as_slice()
                 {
                     spec_ids.insert(*id, *spec_id);
@@ -641,10 +659,10 @@ impl KernelDesc {
                             unreachable!("{inst:?}")
                         };
                         match inst.operands.as_mut_slice() {
-                            [Operand::LiteralInt32(a)] => {
+                            [Operand::LiteralBit32(a)] => {
                                 bytemuck::bytes_of_mut(a).copy_from_slice(value.as_bytes());
                             }
-                            [Operand::LiteralInt32(a), Operand::LiteralInt32(b)] => {
+                            [Operand::LiteralBit32(a), Operand::LiteralBit32(b)] => {
                                 bytemuck::bytes_of_mut(a).copy_from_slice(&value.as_bytes()[..8]);
                                 bytemuck::bytes_of_mut(b).copy_from_slice(&value.as_bytes()[9..]);
                             }

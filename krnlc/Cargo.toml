@@ -26,12 +26,12 @@ clap-cargo = { version = "0.13.0", features = ["cargo_metadata"] }
 anyhow = "1.0.60"
 syn = { version = "1.0.103", features = ["full", "visit", "extra-traits"] }
 cargo_metadata = "0.18.1"
-spirv-builder = { version = "=0.9.0", default-features = false }
+spirv-builder = { git = "https://github.com/jlogan03/rust-gpu", branch = "jlogan/float-controls-intrinsics", default-features = false }
 serde = { version = "1.0.143", default-features = false, features = ["derive"] }
 bincode2 = "2.0.1"
 symlink = "0.1.0"
-rspirv = "0.11.0"
-spirv-tools = { version = "0.9.0", default-features = false }
+rspirv = "0.13"
+spirv-tools = { version = "0.13.3", default-features = false }
 itertools = "0.10.5"
 rayon = "1.7.0"
 flate2 = "1.0.25"
@@ -43,14 +43,20 @@ bytemuck = "1.13.1"
 prettyplease = "0.1.25"
 walkdir = "2.4.0"
 zero85 = "0.2.0"
+url = "2.5"
 
 [features]
 default = ["use-compiled-tools"]
+half = []
 use-compiled-tools = [
     "spirv-builder/use-compiled-tools",
     "spirv-tools/use-compiled-tools",
 ]
 use-installed-tools = [
     "spirv-builder/use-installed-tools",
-    "spirv-builder/use-installed-tools",
+    "spirv-tools/use-installed-tools",
 ]
+
+[patch.crates-io]
+rustc_codegen_spirv = { git = "https://github.com/jlogan03/rust-gpu", branch = "jlogan/float-controls-intrinsics" }
+rustc_codegen_spirv-types = { git = "https://github.com/jlogan03/rust-gpu", branch = "jlogan/float-controls-intrinsics" }
