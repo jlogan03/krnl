@@ -86,7 +86,7 @@ ash = { version = "0.38", optional = true }
 crossbeam-channel = { version = "0.5.8", optional = true }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-moltenvk-static = { git = "https://github.com/jlogan03/moltenvk-static", rev = "e553f4115a509f533e6f58e6e2b2afcf4b647673", optional = true }
+moltenvk-static = { git = "https://github.com/jlogan03/moltenvk-static", rev = "40ef04ca8647a3584bf3b484e90e906308647ceb", optional = true }
 
 [features]
 default = ["device"]
