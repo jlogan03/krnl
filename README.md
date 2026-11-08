@@ -48,13 +48,28 @@ The default build compiles SPIRV-Tools 0.13.3 from source (a C++ compiler is
 required). `--no-default-features --features use-installed-tools` instead uses
 SPIRV-Tools from `PATH`.
 
-For device functionality (kernels), install [Vulkan](https://www.vulkan.org) for your platform.
+For device functionality (kernels), install [Vulkan](https://www.vulkan.org) for your
+platform, except on ARM64 macOS.
+
+On ARM64 macOS 12 or later, krnl links MoltenVK statically via
+`moltenvk-static` as a Vulkan-to-Metal adapter.
+
+Plan to replace MoltenVK with [KosmicKrisp](https://www.lunarg.com/products/kosmickrisp/)
+once its runtime is easier for users to install. This would require macOS 26 or later.
+
+Run the macOS device tests from this checkout with:
+
+```sh
+cargo test -p krnl --features moltenvk-static/build-moltenvk --lib --test integration_tests -- --test-threads=1
+```
 
 Kernels compile with rust-gpu's `rust_math` policy. Ordinary arithmetic preserves
 signed zero, NaN, and infinity and disables reassociation and implicit FMA
 contraction. Explicit `algebraic_*` operations retain their relaxed semantics.
 
-Kernels require subnormal preservation and round-to-nearest/ties-to-even.
+On macOS, krnl keeps the supported rounding and subnormal modes and uses device
+defaults for unsupported modes, including any coupled float widths. Other
+platforms require subnormal preservation and round-to-nearest/ties-to-even.
 All platforms require `shaderFloatControls2` and the special-value preservation
 properties. Numerical schemes that depend on subnormal residuals need testing
 on each target device.

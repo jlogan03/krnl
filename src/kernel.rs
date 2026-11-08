@@ -86,7 +86,10 @@ zero, NaN, and infinity and disallows reassociation and implicit FMA contraction
 Explicit Rust `algebraic_*` operations allow reordering, while `mul_add` remains
 explicitly fused. Kernel attributes do not expose math policies.
 
-Kernels require subnormal preservation and round-to-nearest/ties-to-even.
+On macOS, krnl uses device defaults for unsupported rounding and subnormal modes.
+If a device couples float widths, krnl omits the mode for the whole affected
+group. Supported modes and arithmetic restrictions remain enabled. Other
+platforms require subnormal preservation and round-to-nearest/ties-to-even.
 
 All platforms require Vulkan `shaderFloatControls2` and the per-width properties
 for signed-zero, infinity, and NaN preservation. Missing support returns an error
