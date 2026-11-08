@@ -244,29 +244,35 @@ mod subgroup {
     use krnl_core::macros::kernel;
 
     #[cfg(target_arch = "spirv")]
-    unsafe fn subgroup_add_i32(x: i32, cluster: Option<u32>) -> i32 {
+    unsafe fn subgroup_add_i32(x: i32) -> i32 {
         use core::arch::asm;
 
         let mut y = 0i32;
-        if let Some(cluster) = cluster {
-            asm! {
-                "%u32 = OpTypeInt 32 0",
-                "%subgroup = OpConstant %u32 3",
-                "%y = OpGroupNonUniformIAdd _ %subgroup ClusteredReduce {x} {c}",
-                "OpStore {y} %y",
-                x = in(reg) x,
-                c = in(reg) cluster,
-                y = in(reg) &mut y,
-            }
-        } else {
-            asm! {
-                "%u32 = OpTypeInt 32 0",
-                "%subgroup = OpConstant %u32 3",
-                "%y = OpGroupNonUniformIAdd _ %subgroup Reduce {x}",
-                "OpStore {y} %y",
-                x = in(reg) x,
-                y = in(reg) &mut y,
-            }
+        asm! {
+            "%u32 = OpTypeInt 32 0",
+            "%subgroup = OpConstant %u32 3",
+            "%y = OpGroupNonUniformIAdd _ %subgroup Reduce {x}",
+            "OpStore {y} %y",
+            x = in(reg) x,
+            y = in(reg) &mut y,
+        }
+        y
+    }
+
+    #[cfg(target_arch = "spirv")]
+    unsafe fn subgroup_add_i32_clustered<const CLUSTER: u32>(x: i32) -> i32 {
+        use core::arch::asm;
+
+        let mut y = 0i32;
+        asm! {
+            "%u32 = OpTypeInt 32 0",
+            "%subgroup = OpConstant %u32 3",
+            "%cluster = OpConstant %u32 {cluster}",
+            "%y = OpGroupNonUniformIAdd _ %subgroup ClusteredReduce {x} %cluster",
+            "OpStore {y} %y",
+            cluster = const CLUSTER,
+            x = in(reg) x,
+            y = in(reg) &mut y,
         }
         y
     }
@@ -276,7 +282,7 @@ mod subgroup {
         use krnl_core::buffer::UnsafeIndex;
 
         let x = x[kernel.global_id()];
-        let x = unsafe { subgroup_add_i32(x, None) };
+        let x = unsafe { subgroup_add_i32(x) };
         if kernel.subgroup_thread_id() == 0 {
             unsafe {
                 *y.unsafe_index_mut(
@@ -302,9 +308,10 @@ mod subgroup {
         use krnl_core::buffer::UnsafeIndex;
 
         const CLUSTER: usize = 8;
+        const CLUSTER_U32: u32 = CLUSTER as u32;
 
         let x = x[kernel.global_id()];
-        let x = unsafe { subgroup_add_i32(x, Some(CLUSTER as u32)) };
+        let x = unsafe { subgroup_add_i32_clustered::<CLUSTER_U32>(x) };
         let cluster_id = kernel.subgroup_thread_id() / CLUSTER;
         if kernel.subgroup_thread_id() % CLUSTER == 0 {
             unsafe {
