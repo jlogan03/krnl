@@ -47,6 +47,7 @@ url = "2.5"
 
 [features]
 default = ["use-compiled-tools"]
+half = []
 use-compiled-tools = [
     "spirv-builder/use-compiled-tools",
     "spirv-tools/use-compiled-tools",
