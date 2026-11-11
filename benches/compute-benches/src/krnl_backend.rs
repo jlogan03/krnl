@@ -145,7 +145,7 @@ impl Saxpy {
     pub fn run(&mut self) -> Result<()> {
         kernels::saxpy::builder()?
             .build(self.device.clone())?
-            .dispatch(
+            .dispatch_blocking(
                 self.x_device.as_slice(),
                 self.alpha,
                 self.y_device.as_slice_mut(),

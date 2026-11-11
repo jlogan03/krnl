@@ -61,3 +61,6 @@ pub mod buffer;
 pub mod device;
 /// Kernels.
 pub mod kernel;
+
+/// Ordered GPU work and completion events.
+pub mod stream;

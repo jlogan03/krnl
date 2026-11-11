@@ -15,6 +15,7 @@ dbg!(device.info());
 ```
 */
 
+use crate::stream::{Stream, StreamingOptions};
 #[cfg(feature = "device")]
 use crate::{
     buffer::{MemKind, MemoryProperties},
@@ -26,7 +27,7 @@ use std::{
     sync::Arc,
 };
 #[cfg(feature = "device")]
-use std::{mem::MaybeUninit, ops::Range, sync::atomic::AtomicBool};
+use std::{mem::MaybeUninit, ops::Range};
 
 #[cfg(all(not(target_family = "wasm"), feature = "device"))]
 mod vulkan_engine;
@@ -35,6 +36,11 @@ use vulkan_engine::Engine;
 
 #[cfg(all(target_family = "wasm", feature = "device"))]
 compile_error!("device feature not supported on wasm");
+
+// Each test device reserves large allocator blocks. Serialize device fixtures,
+// while testing concurrent streams and submissions within each fixture.
+#[cfg(all(test, feature = "device"))]
+pub(crate) static TEST_DEVICE_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// Errors.
 pub mod error {
@@ -110,6 +116,20 @@ pub mod builder {
                 self
             }
         }
+        /// Sets initial streaming capacities, batch size, and progress mode.
+        pub fn streaming(self, options: StreamingOptions) -> Self {
+            #[cfg(feature = "device")]
+            {
+                let mut this = self;
+                this.options.streaming = options;
+                this
+            }
+            #[cfg(not(feature = "device"))]
+            {
+                let _ = options;
+                self
+            }
+        }
         /// Creates a device.
         ///
         /// # Errors
@@ -141,13 +161,14 @@ trait DeviceEngine {
     fn new(options: DeviceOptions) -> Result<Arc<Self>>;
     fn id(&self) -> DeviceId;
     fn info(&self) -> &Arc<DeviceInfo>;
-    fn wait(&self) -> Result<(), DeviceLost>;
+    fn wait(&self) -> Result<()>;
 }
 
 #[cfg(feature = "device")]
 struct DeviceOptions {
     index: usize,
     optimal_features: Features,
+    streaming: StreamingOptions,
 }
 
 #[cfg(feature = "device")]
@@ -179,11 +200,11 @@ trait DeviceEngineKernel: Sized {
     ) -> Result<Arc<Self>>;
     unsafe fn dispatch(
         &self,
+        stream: &mut RawStream,
         groups: u32,
         buffers: &[Arc<Self::DeviceBuffer>],
         push_consts: Vec<u8>,
-        debug_printf_panic: Option<Arc<AtomicBool>>,
-    ) -> Result<()>;
+    ) -> Result<CompletionPoint>;
     fn engine(&self) -> &Arc<Self::Engine>;
     fn desc(&self) -> &Arc<KernelDesc>;
 }
@@ -222,8 +243,41 @@ impl Device {
             options: DeviceOptions {
                 index: 0,
                 optimal_features: Features::all(),
+                streaming: StreamingOptions::default(),
             },
         }
+    }
+    /// Creates a stream for kernels and copies.
+    pub fn stream(&self) -> Result<Stream> {
+        self.create_stream(false, None)
+    }
+    /// Creates a copy stream, preferably on a transfer queue.
+    pub fn transfer_stream(&self) -> Result<Stream> {
+        self.create_stream(true, None)
+    }
+    /// Creates a general stream with space for `dependencies` explicit waits.
+    pub fn stream_with_capacity(&self, dependencies: usize) -> Result<Stream> {
+        self.create_stream(false, Some(dependencies))
+    }
+    /// Creates a transfer stream with space for `dependencies` explicit waits.
+    pub fn transfer_stream_with_capacity(&self, dependencies: usize) -> Result<Stream> {
+        self.create_stream(true, Some(dependencies))
+    }
+    fn create_stream(&self, transfer: bool, capacity: Option<usize>) -> Result<Stream> {
+        #[cfg(feature = "device")]
+        if let DeviceInner::Device(device) = &self.inner {
+            return device.stream(transfer, capacity);
+        }
+        let _ = (transfer, capacity);
+        Err(DeviceUnavailable.into())
+    }
+    /// Retires completed work and wakes ready tasks without waiting for GPU work.
+    pub fn poll(&self) -> Result<()> {
+        #[cfg(feature = "device")]
+        if let DeviceInner::Device(device) = &self.inner {
+            return device.poll();
+        }
+        Ok(())
     }
     /// Is the host.
     pub fn is_host(&self) -> bool {
@@ -246,15 +300,11 @@ impl Device {
             DeviceInner::Device(raw) => Some(raw.info()),
         }
     }
-    /** Wait for previous work to finish.
-
-    If host, this does nothing.
-
-    Operations (like kernel dispatches) executed after this method is called
-    will not block, and will not be waited on.
-
-    This is primarily for benchmarking, manual synchronization is unnecessary. */
-    pub fn wait(&self) -> Result<(), DeviceLost> {
+    /// Blocks the calling thread until all work already queued on this device finishes.
+    ///
+    /// The wait covers all streams. Work queued later does not extend the wait.
+    /// Returns immediately for the host.
+    pub fn wait(&self) -> Result<()> {
         match self.inner() {
             DeviceInner::Host => Ok(()),
             #[cfg(feature = "device")]
@@ -327,10 +377,37 @@ impl RawDevice {
         let engine = Engine::new(options)?;
         Ok(Self { engine })
     }
+    pub(crate) fn stream(&self, transfer: bool, capacity: Option<usize>) -> Result<Stream> {
+        let inner = self.engine.stream(
+            transfer,
+            capacity.unwrap_or(self.engine.options.dependency_capacity),
+        )?;
+        Ok(Stream {
+            device: self.clone(),
+            inner,
+        })
+    }
+    pub(crate) fn poll(&self) -> Result<()> {
+        self.engine.poll()
+    }
+    pub(crate) fn wait_point(&self, point: &CompletionPoint) -> Result<()> {
+        self.engine.wait_point(point)
+    }
+    pub(crate) fn record_event(&self, stream: &mut RawStream) -> Result<CompletionPoint> {
+        self.engine.record_event(stream)
+    }
+    pub(crate) fn copy_on(
+        &self,
+        stream: &mut RawStream,
+        src: &DeviceBuffer,
+        dst: &DeviceBuffer,
+    ) -> Result<CompletionPoint> {
+        self.engine.copy_on(stream, &src.inner, &dst.inner)
+    }
     pub(crate) fn info(&self) -> &Arc<DeviceInfo> {
         self.engine.info()
     }
-    pub(crate) fn wait(&self) -> Result<(), DeviceLost> {
+    pub(crate) fn wait(&self) -> Result<()> {
         self.engine.wait()
     }
 }
@@ -381,7 +458,7 @@ fn cast_device_buffers(buffers: &[DeviceBuffer]) -> &[Arc<<Engine as DeviceEngin
 }
 
 #[cfg(feature = "device")]
-pub(crate) use vulkan_engine::DeviceMapping;
+pub(crate) use vulkan_engine::{CompletionPoint, DeviceMapping, RawStream};
 
 #[cfg(feature = "device")]
 impl DeviceBuffer {
@@ -888,18 +965,14 @@ impl RawKernel {
     }
     pub(crate) unsafe fn dispatch(
         &self,
+        stream: &mut RawStream,
         groups: u32,
         buffers: &[DeviceBuffer],
         push_consts: Vec<u8>,
-        debug_printf_panic: Option<Arc<AtomicBool>>,
-    ) -> Result<()> {
+    ) -> Result<CompletionPoint> {
         unsafe {
-            self.inner.dispatch(
-                groups,
-                cast_device_buffers(buffers),
-                push_consts,
-                debug_printf_panic,
-            )
+            self.inner
+                .dispatch(stream, groups, cast_device_buffers(buffers), push_consts)
         }
     }
     pub(crate) fn device(&self) -> RawDevice {

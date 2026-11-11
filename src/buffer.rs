@@ -1580,7 +1580,6 @@ impl<'a, T: Scalar> SliceRepr<'a, T> {
     fn copy_to(&self, mem: Mem<'_>) -> Result<BufferRepr<T>> {
         let mut output = unsafe { BufferRepr::uninit(mem, self.len())? };
         output.as_slice_mut().copy_from_slice(self)?;
-        output.device().wait()?;
         Ok(output)
     }
     fn bitcast<Y: Scalar>(self) -> Result<SliceRepr<'a, Y>, bytemuck::PodCastError> {
@@ -2118,7 +2117,6 @@ impl<T: Scalar, S: DataOwned<Elem = T>> BufferBase<S> {
         }
         let mut output = unsafe { Buffer::uninit(mem, len)? };
         output.fill(elem)?;
-        output.device().wait()?;
         Ok(Self {
             data: S::from_buffer(output.data),
         })
@@ -2394,12 +2392,16 @@ impl<T: Scalar, S: Data<Elem = T>> BufferBase<S> {
             if features.contains(Features::INT64) {
                 if let Ok(y) = self.bitcast_mut::<u64>() {
                     let x = copied_bytes(elem);
-                    return kernels::fill_u64::builder()?.build(device)?.dispatch(x, y);
+                    return kernels::fill_u64::builder()?
+                        .build(device)?
+                        .dispatch_blocking(x, y);
                 }
             }
             if let Ok(y) = self.bitcast_mut::<u32>() {
                 let x = copied_bytes(elem);
-                return kernels::fill_u32::builder()?.build(device)?.dispatch(x, y);
+                return kernels::fill_u32::builder()?
+                    .build(device)?
+                    .dispatch_blocking(x, y);
             }
             if features.contains(
                 Features::INT16
@@ -2408,7 +2410,9 @@ impl<T: Scalar, S: Data<Elem = T>> BufferBase<S> {
             ) {
                 if let Ok(y) = self.bitcast_mut::<u16>() {
                     let x = copied_bytes(elem);
-                    return kernels::fill_u16::builder()?.build(device)?.dispatch(x, y);
+                    return kernels::fill_u16::builder()?
+                        .build(device)?
+                        .dispatch_blocking(x, y);
                 }
             }
             if features.contains(
@@ -2418,7 +2422,9 @@ impl<T: Scalar, S: Data<Elem = T>> BufferBase<S> {
             ) {
                 if let Ok(y) = self.bitcast_mut::<u8>() {
                     let x = copied_bytes(elem);
-                    return kernels::fill_u8::builder()?.build(device)?.dispatch(x, y);
+                    return kernels::fill_u8::builder()?
+                        .build(device)?
+                        .dispatch_blocking(x, y);
                 }
             }
             if self.bitcast::<u16>().is_ok() {
@@ -2459,7 +2465,6 @@ impl<T: Scalar, S: Data<Elem = T>> BufferBase<S> {
         }
         let mut output = unsafe { Buffer::uninit(mem, self.len())? };
         self.as_slice().cast_impl(&mut output.as_slice_mut())?;
-        output.device().wait()?;
         Ok(output)
     }
     /** Casts into `Y`.
@@ -2512,8 +2517,7 @@ impl<T: Scalar, S: Data<Elem = T>> BufferBase<S> {
     where
         S: DataMut,
     {
-        self.data.as_slice_mut().copy_from_slice(&src.data)?;
-        Ok(self.device().wait()?)
+        self.data.as_slice_mut().copy_from_slice(&src.data)
     }
     /** A subslice with `range`.
 
@@ -2566,7 +2570,7 @@ fn device_scalar_buffer_cast_impl(x: ScalarSlice<'_>, y: ScalarSliceMut<'_>) -> 
                             let builder = paste! {
                                 kernels::[<cast_ $X _ $Y>]::builder()?
                             };
-                            return builder.build(y.device())?.dispatch(x, y);
+                            return builder.build(y.device())?.dispatch_blocking(x, y);
                         }
                         Err(y) => y,
                     };
@@ -2726,3 +2730,6 @@ mod tests {
         assert_eq!(x_vec, y_vec);
     }
 }
+
+#[cfg(all(test, feature = "device", not(miri)))]
+mod streaming_tests;

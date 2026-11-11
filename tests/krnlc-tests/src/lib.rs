@@ -54,7 +54,7 @@ mod kernels {
     fn with_groups() {}
 
     fn test_with_groups(device: Device) -> Result<()> {
-        with_groups::builder()?.build(device)?.with_groups(1).dispatch()
+        with_groups::builder()?.build(device)?.with_groups(1).dispatch_blocking()
     }
 
     #[kernel]
@@ -63,7 +63,7 @@ mod kernels {
     ) {}
 
     fn test_with_groups_item(y: SliceMut<u32>) -> Result<()> {
-        with_groups_item::builder()?.build(y.device())?.dispatch(y)
+        with_groups_item::builder()?.build(y.device())?.dispatch_blocking(y)
     }
 }
 ```
@@ -79,7 +79,7 @@ mod kernels {
     fn with_groups() {}
 
     fn test_with_groups(device: Device) -> Result<()> {
-        with_groups::builder()?.build(device)?.dispatch()
+        with_groups::builder()?.build(device)?.dispatch_blocking()
     }
 }
 ```

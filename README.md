@@ -101,7 +101,7 @@ The last three require CPU mapping. Locality and caching are preferences.
 
 Use `Buffer::allocate_with(mem, len, |i| value_at(i))` to fill mapped storage
 directly. Access it through `map_read()` or `map_write()`. Drop the guard before
-GPU use. Copies complete before returning. `to_owned(mem)` copies into a new
+GPU use. Buffer copy methods complete before returning. `to_owned(mem)` copies into a new
 allocation with the requested placement.
 
 # Example
@@ -153,13 +153,13 @@ fn saxpy(alpha: f32, x: Slice<f32>, mut y: SliceMut<f32>) -> Result<()> {
     if true {
         kernels::saxpy::builder()?
             .build(y.device())?
-            .dispatch(alpha, x, y)
+            .dispatch_blocking(alpha, x, y)
     } else {
         // or
         kernels::saxpy_global::builder()?
             .build(y.device())?
             .with_global_threads(y.len() as u32)
-            .dispatch(alpha, x, y)
+            .dispatch_blocking(alpha, x, y)
     }
 }
 
@@ -175,6 +175,59 @@ fn main() -> Result<()> {
     let y = y.into_host_vec()?;
     println!("{y:?}");
     Ok(())
+}
+```
+
+# Streaming
+
+Streaming allows uploads, downloads, and kernel execution to overlap.
+This amortizes the cost of uploads and downloads, increasing peak throughput.
+
+Use `Device::stream()` for both kernels and copies.
+`Device::transfer_stream()` for copies on a dedicated transfer queue when one is available
+from the drivers; this can deconflict resource usage between kernels and data.
+
+Queuing work returns an `Event` handle.
+Wait with `event.wait()` or `event.wait_async().await`.
+
+This example splits one input into three chunks for the `saxpy` kernel above.
+Each chunk has separate buffers. Access tracking orders its upload, kernel, and
+download. Different chunks can overlap when the device supports it.
+
+```rust
+// CPU-side inputs and outputs.
+const CHUNKS: usize = 3;
+const CHUNK_LEN: usize = 1024;
+let input = vec![1.0f32; CHUNKS * CHUNK_LEN];
+let mut output = vec![0.0f32; input.len()];
+
+// Initialize streams and kernel.
+let mut upload = device.transfer_stream()?;
+let mut compute = device.stream()?;
+let mut download = device.transfer_stream()?;
+let kernel = kernels::saxpy::builder()?.build(device.clone())?;
+
+// Allocate one slot per chunk before queuing work.
+let mut slots = Vec::with_capacity(CHUNKS);
+for chunk in input.chunks(CHUNK_LEN) {
+    slots.push((
+        Slice::from_host_slice(chunk).to_owned(Mem::Upload(&device))?,
+        Buffer::<f32>::zeros(Mem::Device(&device), chunk.len())?,
+        Buffer::<f32>::zeros(Mem::Device(&device), chunk.len())?,
+        Buffer::<f32>::zeros(Mem::Readback(&device), chunk.len())?,
+    ));
+}
+
+// Queue every chunk without waiting on the CPU.
+for (staging, x, y, readback) in &mut slots {
+    upload.copy(staging.as_slice(), x.as_slice_mut())?;  // Task: upload data
+    kernel.dispatch(&mut compute, 2.0, x.as_slice(), y.as_slice_mut())?;  // Task: execute kernel
+    download.copy(y.as_slice(), readback.as_slice_mut())?;  // Task: download data
+}
+
+// Copy output chunks back to the CPU-side incrementally as they are completed.
+for ((_, _, _, readback), chunk) in slots.iter().zip(output.chunks_mut(CHUNK_LEN)) {
+    chunk.copy_from_slice(&readback.map_read()?);
 }
 ```
 

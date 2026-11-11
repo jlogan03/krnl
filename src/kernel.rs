@@ -53,13 +53,13 @@ fn saxpy(alpha: f32, x: Slice<f32>, mut y: SliceMut<f32>) -> Result<()> {
     # if true {
     kernels::saxpy::builder()?
         .build(y.device())?
-        .dispatch(alpha, x, y)
+        .dispatch_blocking(alpha, x, y)
     # } else {
     // or
     kernels::saxpy_global::builder()?
         .build(y.device())?
         .with_global_threads(y.len() as u32)
-        .dispatch(alpha, x, y)
+        .dispatch_blocking(alpha, x, y)
     # }
 }
 
@@ -273,7 +273,7 @@ if let Some(x) = x.as_host_slice() {
     let mut y = Buffer::zeros(Mem::Device(&x.device()), x.len())?;
     scale_to_f32::builder()?
         .build(x.device())?
-        .dispatch(x, y.as_slice_mut())?;
+        .dispatch_blocking(x, y.as_slice_mut())?;
     Ok(y)
 }
 # }
@@ -282,7 +282,7 @@ if let Some(x) = x.as_host_slice() {
 
 # Push Constants
 Scalar arguments without an attribute. Unlike [SpecConstants](#specialization), they are
-provided to [`.dispatch(..)`](#dispatch), and do not require rebuilding the kernel.
+provided to [`.dispatch_blocking(..)`](#dispatch), and do not require rebuilding the kernel.
 
 At least 128 bytes of push constants can be used, depending on the device. Each [item](#items) or
 [global](#global-buffers)  argument requires 8 bytes of push constants.
@@ -303,7 +303,7 @@ threads, unless `threads` per group is not an exact multiple, where the last sub
 
 # Global Buffers
 Visible to all threads. [Slice](krnl_core::buffer::Slice) binds to [Slice](crate::buffer::Slice), [UnsafeSlice](krnl_core::buffer::UnsafeSlice) binds
-to [SliceMut](crate::buffer::SliceMut), provided to [`.dispatch(..)`](#dispatch).
+to [SliceMut](crate::buffer::SliceMut), provided to [`.dispatch_blocking(..)`](#dispatch).
 
 For best performance, consecutive threads should access consecutive elements, allowing loads and stores to be coalesced
 into fewer memory transactions.
@@ -407,16 +407,10 @@ pub mod saxpy {
     }
 
     impl Kernel<WithGroups<true>> {
-        /// Dispatches the kernel.
-        ///
-        /// - Waits for immutable access to slice arguments.
-        /// - Waits for mutable access to mutable slice arguments.
-        /// - Blocks until the kernel is queued.
-        ///
-        /// # Errors
-        /// - [`DeviceLost`].
-        /// - The kernel could not be queued.
-        pub fn dispatch(&self, alpha: f32, x: Slice<f32>, y: SliceMut<f32>) -> Result<()>;
+        /// Enqueues the kernel on a general stream.
+        pub fn dispatch(&self, stream: &mut Stream, alpha: f32, x: Slice<f32>, y: SliceMut<f32>) -> Result<Event>;
+        /// Dispatches the kernel and waits for completion.
+        pub fn dispatch_blocking(&self, alpha: f32, x: Slice<f32>, y: SliceMut<f32>) -> Result<()>;
     }
 }
 # fn main() {}
@@ -485,14 +479,14 @@ Once [built](#KernelBuilder), the [groups](#groups-subgroups-and-threads) to dis
 or `.with_global_threads(..)` which rounds up to the next multiple of threads. [Item kernels](#items)
 infer the global_threads based on the number of items.
 
-The `.dispatch(..)` method blocks until the kernel is queued. One kernel can be queued
-while another is executing.
+Use `.dispatch(&mut stream, ..)` to enqueue work and receive a completion
+[`Event`](crate::stream::Event). A stream orders its commands. Buffer access
+tracking orders conflicting accesses across streams by acceptance order.
+Independent streams can overlap when the device has suitable queues.
 
-When a kernel begins executing, the device will begin processing one or more groups
-in parallel, untill all groups have finished.
-
-Synchronization is automatically performed as necessary between kernels and when transfering buffers
-to and from devices. [`Device::wait()`](crate::device::Device::wait) can be used to explicitly wait for prior operations to complete.
+Use `.dispatch_blocking(..)` to wait for one kernel, or
+[`Device::wait()`](crate::device::Device::wait) to wait for all previously accepted work.
+CPU mapping guards must be released before enqueueing GPU access to their allocations.
 
 # SPIR-V
 [Binary intermediate representation](https://www.khronos.org/spir) for graphics shaders that can be used with [Vulkan](https://www.vulkan.org).
@@ -577,11 +571,7 @@ use dry::macro_wrap;
 use rspirv::{binary::Assemble, dr::Operand};
 use std::{borrow::Cow, sync::Arc};
 #[cfg(feature = "device")]
-use std::{
-    collections::HashMap,
-    hash::Hash,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{collections::HashMap, hash::Hash};
 
 #[cfg_attr(not(feature = "device"), allow(dead_code))]
 #[derive(Clone, Debug)]
@@ -1081,6 +1071,13 @@ pub mod __private {
         groups: Option<u32>,
     }
 
+    #[cfg(feature = "device")]
+    struct PreparedDispatch {
+        groups: u32,
+        buffers: Vec<crate::device::DeviceBuffer>,
+        push_bytes: Vec<u8>,
+    }
+
     impl Kernel {
         pub fn threads(&self) -> u32 {
             self.threads
@@ -1113,103 +1110,125 @@ pub mod __private {
                 unreachable!()
             }
         }
-        pub unsafe fn dispatch(
+        pub unsafe fn dispatch_blocking(
             &self,
             slices: &[KernelSliceArg],
             push_consts: &[ScalarElem],
         ) -> Result<()> {
             #[cfg(feature = "device")]
             {
-                let desc = &self.inner.desc();
-                let kernel_name = &desc.name;
-                let mut buffers = Vec::with_capacity(desc.slice_descs.len());
-                let mut items: Option<u32> = None;
-                let device = self.inner.device();
-                let mut push_bytes = Vec::with_capacity(desc.push_consts_range() as usize);
-                debug_assert_eq!(push_consts.len(), desc.push_descs.len());
-                for (push, push_desc) in push_consts.iter().zip(desc.push_descs.iter()) {
-                    debug_assert_eq!(push.scalar_type(), push_desc.scalar_type);
-                    debug_assert_eq!(push_bytes.len() % push.scalar_type().size(), 0);
-                    push_bytes.extend_from_slice(push.as_bytes());
-                }
-                while push_bytes.len() % 4 != 0 {
-                    push_bytes.push(0);
-                }
-                for (slice, slice_desc) in slices.iter().zip(desc.slice_descs.iter()) {
-                    debug_assert_eq!(slice.scalar_type(), slice_desc.scalar_type);
-                    debug_assert!(!slice_desc.mutable || slice.mutable());
-                    let slice_name = &slice_desc.name;
-                    if slice.len() == 0 {
-                        bail!("Kernel `{kernel_name}`.`{slice_name}` is empty!");
-                    }
-                    let buffer = if let Some(buffer) = slice.device_buffer() {
-                        buffer
-                    } else {
-                        bail!("Kernel `{kernel_name}`.`{slice_name}` expected device, found host!");
-                    };
-                    let buffer_device = buffer.device();
-                    if device != buffer_device {
-                        bail!(
-                            "Kernel `{kernel_name}`.`{slice_name}`, expected `{device:?}`, found {buffer_device:?}!"
-                        );
-                    }
-                    buffers.push(buffer.clone());
-                    if slice_desc.item {
-                        items.replace(if let Some(items) = items {
-                            items.min(slice.len() as u32)
-                        } else {
-                            slice.len() as u32
-                        });
-                    }
-                    let width = slice_desc.scalar_type.size();
-                    let offset = buffer.offset() / width;
-                    let len = buffer.len() / width;
-                    push_bytes.extend_from_slice(&offset.to_u32().unwrap().to_ne_bytes());
-                    push_bytes.extend_from_slice(&len.to_u32().unwrap().to_ne_bytes());
-                }
-                let info = self.inner.device().info().clone();
-                let max_groups = info.max_groups();
-                let groups = if let Some(groups) = self.groups {
-                    if groups > max_groups {
-                        bail!("Kernel `{kernel_name}` groups {groups} is greater than max_groups {max_groups}!");
-                    }
-                    groups
-                } else if let Some(items) = items {
-                    let threads = self.threads;
-                    let groups = items / threads + u32::from(items % threads != 0);
-                    groups.min(max_groups)
-                } else {
-                    unreachable!("groups not provided!")
-                };
-                let debug_printf_panic = if info.debug_printf() {
-                    Some(Arc::new(AtomicBool::default()))
-                } else {
-                    None
-                };
-                unsafe {
-                    self.inner.dispatch(
-                        groups,
-                        &buffers,
-                        push_bytes,
-                        debug_printf_panic.clone(),
-                    )?;
-                }
-                if let Some(debug_printf_panic) = debug_printf_panic {
-                    device.wait()?;
-                    while Arc::strong_count(&debug_printf_panic) > 1 {
-                        std::thread::yield_now();
-                    }
-                    if debug_printf_panic.load(Ordering::SeqCst) {
-                        bail!("Kernel `{kernel_name}` panicked!");
-                    }
-                }
-                Ok(())
+                let device: crate::device::Device = self.inner.device().into();
+                let mut stream = device.stream()?;
+                unsafe { self.dispatch(&mut stream, slices, push_consts)? }.wait()
             }
             #[cfg(not(feature = "device"))]
             {
                 let _ = (slices, push_consts);
+                Err(crate::device::error::DeviceUnavailable.into())
+            }
+        }
+        pub unsafe fn dispatch(
+            &self,
+            stream: &mut crate::stream::Stream,
+            slices: &[KernelSliceArg],
+            push_consts: &[ScalarElem],
+        ) -> Result<crate::stream::Event> {
+            #[cfg(feature = "device")]
+            {
+                let device = self.inner.device();
+                anyhow::ensure!(
+                    device == stream.device,
+                    "The stream belongs to a different device."
+                );
+                let PreparedDispatch {
+                    groups,
+                    buffers,
+                    push_bytes,
+                } = self.prepare(slices, push_consts)?;
+                let point = unsafe {
+                    self.inner
+                        .dispatch(&mut stream.inner, groups, &buffers, push_bytes)?
+                };
+                Ok(crate::stream::Event { device, point })
+            }
+            #[cfg(not(feature = "device"))]
+            {
+                let _ = (stream, slices, push_consts);
                 unreachable!()
             }
+        }
+        #[cfg(feature = "device")]
+        fn prepare(
+            &self,
+            slices: &[KernelSliceArg],
+            push_consts: &[ScalarElem],
+        ) -> Result<PreparedDispatch> {
+            let desc = &self.inner.desc();
+            let kernel_name = &desc.name;
+            let mut buffers = Vec::with_capacity(desc.slice_descs.len());
+            let mut items: Option<u32> = None;
+            let device = self.inner.device();
+            let mut push_bytes = Vec::with_capacity(desc.push_consts_range() as usize);
+            debug_assert_eq!(push_consts.len(), desc.push_descs.len());
+            for (push, push_desc) in push_consts.iter().zip(desc.push_descs.iter()) {
+                debug_assert_eq!(push.scalar_type(), push_desc.scalar_type);
+                debug_assert_eq!(push_bytes.len() % push.scalar_type().size(), 0);
+                push_bytes.extend_from_slice(push.as_bytes());
+            }
+            while push_bytes.len() % 4 != 0 {
+                push_bytes.push(0);
+            }
+            for (slice, slice_desc) in slices.iter().zip(desc.slice_descs.iter()) {
+                debug_assert_eq!(slice.scalar_type(), slice_desc.scalar_type);
+                debug_assert!(!slice_desc.mutable || slice.mutable());
+                let slice_name = &slice_desc.name;
+                if slice.len() == 0 {
+                    bail!("Kernel `{kernel_name}`.`{slice_name}` is empty!");
+                }
+                let buffer = if let Some(buffer) = slice.device_buffer() {
+                    buffer
+                } else {
+                    bail!("Kernel `{kernel_name}`.`{slice_name}` expected device, found host!");
+                };
+                let buffer_device = buffer.device();
+                if device != buffer_device {
+                    bail!(
+                            "Kernel `{kernel_name}`.`{slice_name}`, expected `{device:?}`, found {buffer_device:?}!"
+                        );
+                }
+                buffers.push(buffer.clone());
+                if slice_desc.item {
+                    items.replace(if let Some(items) = items {
+                        items.min(slice.len() as u32)
+                    } else {
+                        slice.len() as u32
+                    });
+                }
+                let width = slice_desc.scalar_type.size();
+                let offset = buffer.offset() / width;
+                let len = buffer.len() / width;
+                push_bytes.extend_from_slice(&offset.to_u32().unwrap().to_ne_bytes());
+                push_bytes.extend_from_slice(&len.to_u32().unwrap().to_ne_bytes());
+            }
+            let info = self.inner.device().info().clone();
+            let max_groups = info.max_groups();
+            let groups = if let Some(groups) = self.groups {
+                if groups > max_groups {
+                    bail!("Kernel `{kernel_name}` groups {groups} is greater than max_groups {max_groups}!");
+                }
+                groups
+            } else if let Some(items) = items {
+                let threads = self.threads;
+                let groups = items / threads + u32::from(items % threads != 0);
+                groups.min(max_groups)
+            } else {
+                unreachable!("groups not provided!")
+            };
+            Ok(PreparedDispatch {
+                groups,
+                buffers,
+                push_bytes,
+            })
         }
         pub fn features(&self) -> Features {
             #[cfg(feature = "device")]

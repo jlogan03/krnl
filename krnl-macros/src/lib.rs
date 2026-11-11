@@ -1745,18 +1745,19 @@ fn kernel_impl(item_tokens: TokenStream2) -> Result<TokenStream2> {
                 }
 
                 impl Kernel #kernel_dispatch_generics {
-                    /// Dispatches the kernel.
-                    ///
-                    /// - Waits for immutable access to slice arguments.
-                    /// - Waits for mutable access to mutable slice arguments.
-                    /// - Blocks until the kernel is queued.
-                    ///
-                    /// # Errors
-                    /// - [`DeviceLost`].
-                    /// - The kernel could not be queued.
-                    pub #unsafe_token fn dispatch(&self, #dispatch_args) -> Result<()> {
-                        unsafe { self.inner.dispatch(&[#dispatch_slice_args], &[#(#dispatch_push_args.into()),*]) }
+                    /// Dispatches the kernel and waits for completion.
+                    pub #unsafe_token fn dispatch_blocking(&self, #dispatch_args) -> Result<()> {
+                        unsafe { self.inner.dispatch_blocking(&[#dispatch_slice_args], &[#(#dispatch_push_args.into()),*]) }
                     }
+
+                    /// Enqueues the kernel on a general stream.
+                    ///
+                    /// Buffer dependencies follow enqueue acceptance order.
+                    /// The returned event reports completion and execution errors.
+                    pub #unsafe_token fn dispatch(&self, stream: &mut __krnl::stream::Stream, #dispatch_args) -> Result<__krnl::stream::Event> {
+                        unsafe { self.inner.dispatch(stream, &[#dispatch_slice_args], &[#(#dispatch_push_args.into()),*]) }
+                    }
+
                 }
             }
         }
