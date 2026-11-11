@@ -95,6 +95,15 @@ Kernel attributes do not expose math policies.
 
 See the [docs](https://docs.rs/krnl) or build them locally with `cargo doc --all-features`.
 
+Choose memory placement on allocation with `Mem::Host`, `Mem::Device(&device)`,
+`Mem::Shared(&device)`, `Mem::Upload(&device)`, or `Mem::Readback(&device)`.
+The last three require CPU mapping. Locality and caching are preferences.
+
+Use `Buffer::allocate_with(mem, len, |i| value_at(i))` to fill mapped storage
+directly. Access it through `map_read()` or `map_write()`. Drop the guard before
+GPU use. Copies complete before returning. `to_owned(mem)` copies into a new
+allocation with the requested placement.
+
 # Example
 
 ```rust
@@ -102,7 +111,7 @@ use krnl::{
     macros::module,
     anyhow::Result,
     device::Device,
-    buffer::{Buffer, Slice, SliceMut},
+    buffer::{Buffer, Mem, Slice, SliceMut},
 };
 
 #[module]
@@ -159,10 +168,11 @@ fn main() -> Result<()> {
     let alpha = 2f32;
     let y = vec![0f32];
     let device = Device::builder().build().ok().unwrap_or(Device::host());
-    let x = Buffer::from(x).into_device(device.clone())?;
-    let mut y = Buffer::from(y).into_device(device.clone())?;
+    let mem = if device.is_host() { Mem::Host } else { Mem::Device(&device) };
+    let x = Buffer::from_host_vec(x).into_owned(mem)?;
+    let mut y = Buffer::from_host_vec(y).into_owned(mem)?;
     saxpy(alpha, x.as_slice(), y.as_slice_mut())?;
-    let y = y.into_vec()?;
+    let y = y.into_host_vec()?;
     println!("{y:?}");
     Ok(())
 }

@@ -16,14 +16,17 @@ dbg!(device.info());
 */
 
 #[cfg(feature = "device")]
-use crate::kernel::{KernelDesc, KernelKey};
+use crate::{
+    buffer::{MemKind, MemoryProperties},
+    kernel::{KernelDesc, KernelKey},
+};
 use anyhow::Result;
 use std::{
     fmt::{self, Debug},
     sync::Arc,
 };
 #[cfg(feature = "device")]
-use std::{ops::Range, sync::atomic::AtomicBool};
+use std::{mem::MaybeUninit, ops::Range, sync::atomic::AtomicBool};
 
 #[cfg(all(not(target_family = "wasm"), feature = "device"))]
 mod vulkan_engine;
@@ -150,9 +153,14 @@ struct DeviceOptions {
 #[cfg(feature = "device")]
 trait DeviceEngineBuffer: Sized {
     type Engine;
-    unsafe fn uninit(engine: Arc<Self::Engine>, len: usize) -> Result<Self>;
+    unsafe fn uninit(engine: Arc<Self::Engine>, len: usize, kind: MemKind) -> Result<Self>;
+    fn kind(&self) -> MemKind;
+    fn memory_properties(&self) -> Option<MemoryProperties>;
+    fn host_visible(&self) -> bool;
+    fn map(&self, write: bool, wait: bool) -> Result<DeviceMapping>;
+    fn copy(&self, dst: &Self) -> Result<()>;
     fn upload(&self, data: &[u8]) -> Result<()>;
-    fn download(&self, data: &mut [u8]) -> Result<()>;
+    fn download(&self, data: &mut [MaybeUninit<u8>]) -> Result<()>;
     fn transfer(&self, dst: &Self) -> Result<()>;
     fn engine(&self) -> &Arc<Self::Engine>;
     fn offset(&self) -> usize;
@@ -373,20 +381,39 @@ fn cast_device_buffers(buffers: &[DeviceBuffer]) -> &[Arc<<Engine as DeviceEngin
 }
 
 #[cfg(feature = "device")]
+pub(crate) use vulkan_engine::DeviceMapping;
+
+#[cfg(feature = "device")]
 impl DeviceBuffer {
+    pub(crate) fn map(&self, write: bool, wait: bool) -> Result<DeviceMapping> {
+        self.inner.map(write, wait)
+    }
+    pub(crate) fn kind(&self) -> MemKind {
+        self.inner.kind()
+    }
+    pub(crate) fn host_visible(&self) -> bool {
+        self.inner.host_visible()
+    }
+    pub(crate) fn memory_properties(&self) -> Option<MemoryProperties> {
+        self.inner.memory_properties()
+    }
+    pub(crate) fn copy(&self, dst: &Self) -> Result<()> {
+        self.inner.copy(&dst.inner)
+    }
     const MAX_SIZE: usize = i32::MAX as usize;
-    pub(crate) unsafe fn uninit(device: RawDevice, len: usize) -> Result<Self> {
+    pub(crate) unsafe fn uninit(device: RawDevice, len: usize, kind: MemKind) -> Result<Self> {
         if len > Self::MAX_SIZE {
             return Err(DeviceBufferTooLarge { bytes: len }.into());
         }
-        let inner =
-            unsafe { <Engine as DeviceEngine>::DeviceBuffer::uninit(device.engine, len)?.into() };
+        let inner = unsafe {
+            <Engine as DeviceEngine>::DeviceBuffer::uninit(device.engine, len, kind)?.into()
+        };
         Ok(Self { inner })
     }
     pub(crate) fn upload(&self, data: &[u8]) -> Result<()> {
         self.inner.upload(data)
     }
-    pub(crate) fn download(&self, data: &mut [u8]) -> Result<()> {
+    pub(crate) fn download(&self, data: &mut [MaybeUninit<u8>]) -> Result<()> {
         self.inner.download(data)
     }
     pub(crate) fn transfer(&self, dst: &Self) -> Result<()> {

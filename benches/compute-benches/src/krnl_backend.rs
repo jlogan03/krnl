@@ -6,7 +6,7 @@ use crate::saxpy_host;
 use approx::assert_relative_eq;
 use krnl::{
     anyhow::Result,
-    buffer::{Buffer, Slice, SliceMut},
+    buffer::{Buffer, Mem, Slice, SliceMut},
     device::Device,
     macros::module,
 };
@@ -23,11 +23,11 @@ impl KrnlBackend {
         })
     }
     pub fn alloc(&self, len: usize) -> Result<Alloc> {
-        let x_device = unsafe { Buffer::uninit(self.device.clone(), len)? };
+        let x_device = unsafe { Buffer::uninit(Mem::Device(&self.device), len)? };
         Ok(Alloc { x_device })
     }
     pub fn upload(&self, x: &[f32]) -> Result<Upload> {
-        let y_device = Buffer::zeros(self.device.clone(), x.len())?;
+        let y_device = Buffer::zeros(Mem::Device(&self.device), x.len())?;
         self.device.wait()?;
         Ok(Upload {
             x_host: x.to_vec(),
@@ -35,7 +35,7 @@ impl KrnlBackend {
         })
     }
     pub fn download(&self, x: &[f32]) -> Result<Download> {
-        let x_device = Slice::from(x).to_device(self.device.clone())?;
+        let x_device = Slice::from(x).to_owned(Mem::Device(&self.device))?;
         Ok(Download {
             #[cfg(debug_assertions)]
             x_host: x.to_vec(),
@@ -49,8 +49,8 @@ impl KrnlBackend {
     pub fn saxpy(&self, x: &[f32], alpha: f32, y: &[f32]) -> Result<Saxpy> {
         assert_eq!(x.len(), y.len());
         let device = self.device.clone();
-        let x_device = Slice::from(x).to_device(device.clone())?;
-        let y_device = Slice::from(y).to_device(device.clone())?;
+        let x_device = Slice::from(x).to_owned(Mem::Device(&device))?;
+        let y_device = Slice::from(y).to_owned(Mem::Device(&device))?;
         device.wait()?;
         #[cfg(debug_assertions)]
         let y_host = {
@@ -84,7 +84,7 @@ impl Upload {
             .copy_from_slice(&self.x_host.as_slice().into())?;
         #[cfg(debug_assertions)]
         {
-            let y_host = self.y_device.to_vec()?;
+            let y_host = self.y_device.to_host_vec()?;
             assert_eq!(self.x_host, y_host);
         }
         Ok(())
@@ -117,7 +117,7 @@ pub struct Zero {
 impl Zero {
     fn new(device: Device, len: usize) -> Result<Self> {
         Ok(Self {
-            y_device: Buffer::zeros(device, len)?,
+            y_device: Buffer::zeros(Mem::Device(&device), len)?,
         })
     }
     pub fn run(&mut self) -> Result<()> {
@@ -125,7 +125,7 @@ impl Zero {
         self.y_device.device().wait()?;
         #[cfg(debug_assertions)]
         {
-            let y_host = self.y_device.to_vec()?;
+            let y_host = self.y_device.to_host_vec()?;
             assert_eq!(y_host, vec![0f32; self.y_device.len()]);
         }
         Ok(())
@@ -153,7 +153,7 @@ impl Saxpy {
         self.device.wait()?;
         #[cfg(debug_assertions)]
         {
-            let y_device = self.y_device.to_vec()?;
+            let y_device = self.y_device.to_host_vec()?;
             assert_relative_eq!(self.y_host.as_slice(), y_device.as_slice());
         }
         Ok(())

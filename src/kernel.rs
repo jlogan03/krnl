@@ -10,7 +10,7 @@ use krnl::{
     macros::module,
     anyhow::Result,
     device::Device,
-    buffer::{Buffer, Slice, SliceMut},
+    buffer::{Buffer, Mem, Slice, SliceMut},
 };
 
 #[module]
@@ -68,10 +68,11 @@ fn main() -> Result<()> {
     let x = vec![1f32];
     let y = vec![0f32];
     let device = Device::builder().build().ok().unwrap_or(Device::host());
-    let x = Buffer::from(x).into_device(device.clone())?;
-    let mut y = Buffer::from(y).into_device(device.clone())?;
+    let mem = if device.is_host() { Mem::Host } else { Mem::Device(&device) };
+    let x = Buffer::from_host_vec(x).into_owned(mem)?;
+    let mut y = Buffer::from_host_vec(y).into_owned(mem)?;
     saxpy(alpha, x.as_slice(), y.as_slice_mut())?;
-    let y = y.into_vec()?;
+    let y = y.into_host_vec()?;
     println!("{y:?}");
     Ok(())
 }
@@ -254,7 +255,7 @@ have an implcit [ItemKernel](krnl_core::kernel::ItemKernel) argument.
 Mapping a buffer with a fn:
 ```no_run
 # #[krnl::macros::module] #[krnl(no_build)] mod kernels {
-# use krnl::{macros::kernel, buffer::{Buffer, Slice}, anyhow::Result};
+# use krnl::{macros::kernel, buffer::{Buffer, Mem, Slice}, anyhow::Result};
 fn scale_to_f32_impl(x: u8) -> f32 {
     x as f32 / 255.
 }
@@ -269,7 +270,7 @@ if let Some(x) = x.as_host_slice() {
     let y: Vec<f32> = x.iter().copied().map(scale_to_f32_impl).collect();
     Ok(Buffer::from(y))
 } else {
-    let mut y = Buffer::zeros(x.device(), x.len())?;
+    let mut y = Buffer::zeros(Mem::Device(&x.device()), x.len())?;
     scale_to_f32::builder()?
         .build(x.device())?
         .dispatch(x, y.as_slice_mut())?;

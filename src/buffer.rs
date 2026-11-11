@@ -5,9 +5,57 @@ store data inline, essentially as a [`Vec`] or [slice](https://doc.rust-lang.org
 
 [`BufferBase`](crate::buffer::BufferBase) is a generic buffer. [`ScalarBufferBase`](crate::buffer::ScalarBufferBase) is a dynamically typed buffer.
 
+# Memory placement
+
+Choose [`Mem`](crate::buffer::Mem) when an operation allocates storage:
+
+| Placement | Access | Preference |
+| --- | --- | --- |
+| `Host` | CPU | Ordinary host storage |
+| `Device(&device)` | GPU | Device-local memory |
+| `Shared(&device)` | CPU and GPU | Device-local, CPU-cached memory |
+| `Upload(&device)` | CPU and GPU | Sequential CPU writes |
+| `Readback(&device)` | CPU and GPU | CPU-cached memory |
+
+GPU placements support kernels and copies. Locality and caching are preferences.
+Several placements can select the same memory type. Use
+[`memory_properties()`](crate::buffer::BufferBase::memory_properties) to inspect the allocation.
+
+[`allocate_with()`](crate::buffer::BufferBase::allocate_with) writes each element directly into
+CPU-accessible storage. It does not allocate a temporary vector or first fill
+the storage with zeros. It accepts every placement except `Device`.
+
+```no_run
+# use krnl::{anyhow::Result, buffer::{Buffer, Mem}, device::Device};
+# fn main() -> Result<()> {
+let device = Device::builder().build()?;
+let input = Buffer::allocate_with(Mem::Upload(&device), 1024, |i| i as u32)?;
+let mut work = input.to_owned(Mem::Device(&device))?;
+work.fill(1)?;
+let result = work.to_owned(Mem::Readback(&device))?;
+let read = result.map_read()?;
+assert_eq!(read[0], 1);
+# Ok(())
+# }
+```
+
+Copies complete before returning. Mapping waits for pending GPU access.
+`try_map_read` and `try_map_write` return [`MapError::Busy`](crate::buffer::MapError::Busy) instead of waiting.
+Mapping never changes placement or copies data. `Device` storage supports mapping
+only when its selected memory type permits it.
+
+Guards reserve the whole allocation, including its slices and bitcasts.
+A write guard excludes other CPU access. Any CPU guard prevents GPU submission
+for that allocation. Drop the guard before dispatching a kernel or GPU copy.
+Guards handle cache invalidation and flushing when the memory requires them.
+
+`Shared` describes memory access. [`ArcBuffer`](crate::buffer::ArcBuffer) provides shared ownership.
+Direct host-slice access remains limited to `Host` storage. Serialization maps
+the buffer for reading. Copy unmappable storage to `Host` before serialization.
+
 # Example
 ```
-use krnl::{anyhow::Result, device::Device, buffer::{Buffer, Slice, SliceMut}};
+use krnl::{anyhow::Result, device::Device, buffer::{Buffer, Mem, Slice, SliceMut}};
 
 fn saxpy(x: Slice<f32>, alpha: f32, mut y: SliceMut<f32>) -> Result<()> {
     if let Some((x, y)) = x.as_host_slice().zip(y.as_host_slice_mut()) {
@@ -27,10 +75,11 @@ fn main() -> Result<()> {
     let device = Device::builder().build().ok().unwrap_or(Device::host());
     # }
     # let device = Device::host();
-    let x = Buffer::from(x).into_device(device.clone())?;
-    let mut y = Buffer::from(y).into_device(device.clone())?;
+    let mem = if device.is_host() { Mem::Host } else { Mem::Device(&device) };
+    let x = Buffer::from_host_vec(x).into_owned(mem)?;
+    let mut y = Buffer::from_host_vec(y).into_owned(mem)?;
     saxpy(x.as_slice(), alpha, y.as_slice_mut())?;
-    let y = y.into_vec()?;
+    let y = y.into_host_vec()?;
     println!("{y:?}");
     Ok(())
 }
@@ -102,6 +151,12 @@ pub mod error {
 #[cfg(doc)]
 use error::{DeviceBufferTooLarge, OutOfDeviceMemory};
 
+mod memory;
+use memory::Mapping;
+#[cfg(feature = "device")]
+pub(crate) use memory::MemKind;
+pub use memory::{MapError, Mem, MemoryProperties, ReadGuard, WriteGuard};
+
 #[derive(Copy, Clone)]
 struct RawHostSlice {
     ptr: *mut u8,
@@ -109,11 +164,13 @@ struct RawHostSlice {
 }
 
 impl RawHostSlice {
+    #[cfg(feature = "device")]
     unsafe fn as_bytes<'a>(&self) -> &'a [u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
-    unsafe fn as_bytes_mut<'a>(&mut self) -> &'a mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    #[cfg(feature = "device")]
+    unsafe fn as_uninit_bytes<'a>(&mut self) -> &'a mut [std::mem::MaybeUninit<u8>] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.cast(), self.len) }
     }
 }
 
@@ -123,6 +180,28 @@ struct RawSlice {
 }
 
 impl RawSlice {
+    fn matches(&self, mem: Mem<'_>) -> Result<bool> {
+        let device = mem.device()?;
+        Ok(match &self.inner {
+            RawSliceInner::Host(_) => device.is_host(),
+            #[cfg(feature = "device")]
+            RawSliceInner::Device(buffer) => device == self.device() && buffer.kind() == mem.kind(),
+        })
+    }
+    fn memory_properties(&self) -> Option<MemoryProperties> {
+        match &self.inner {
+            RawSliceInner::Host(_) => None,
+            #[cfg(feature = "device")]
+            RawSliceInner::Device(buffer) => buffer.memory_properties(),
+        }
+    }
+    fn is_host_visible(&self) -> bool {
+        match &self.inner {
+            RawSliceInner::Host(_) => true,
+            #[cfg(feature = "device")]
+            RawSliceInner::Device(buffer) => buffer.host_visible(),
+        }
+    }
     fn device(&self) -> Device {
         match &self.inner {
             RawSliceInner::Host(_) => Device::host(),
@@ -172,9 +251,11 @@ impl RawSlice {
         }
         match &mut self.inner {
             RawSliceInner::Host(raw) => {
-                let slice = unsafe { raw.as_bytes().get(start..end)? };
-                raw.ptr = slice.as_ptr() as *mut u8;
-                raw.len = slice.len();
+                if start > end {
+                    return None;
+                }
+                raw.ptr = unsafe { raw.ptr.add(start) };
+                raw.len = end - start;
             }
             #[cfg(feature = "device")]
             RawSliceInner::Device(buffer) => {
@@ -211,16 +292,16 @@ impl Drop for RawBuffer {
             unsafe {
                 match self.width {
                     1 => {
-                        Vec::<u8>::from_raw_parts(ptr as _, len, cap);
+                        Vec::<std::mem::MaybeUninit<u8>>::from_raw_parts(ptr as _, len, cap);
                     }
                     2 => {
-                        Vec::<u16>::from_raw_parts(ptr as _, len, cap);
+                        Vec::<std::mem::MaybeUninit<u16>>::from_raw_parts(ptr as _, len, cap);
                     }
                     4 => {
-                        Vec::<u32>::from_raw_parts(ptr as _, len, cap);
+                        Vec::<std::mem::MaybeUninit<u32>>::from_raw_parts(ptr as _, len, cap);
                     }
                     8 => {
-                        Vec::<u64>::from_raw_parts(ptr as _, len, cap);
+                        Vec::<std::mem::MaybeUninit<u64>>::from_raw_parts(ptr as _, len, cap);
                     }
                     _ => unreachable!(),
                 }
@@ -291,9 +372,9 @@ pub trait ScalarData: Sealed {
         }
     }
     #[doc(hidden)]
-    fn to_scalar_arc_buffer(&self) -> Result<ScalarArcBufferRepr> {
+    fn to_scalar_arc_buffer(&self, mem: Mem<'_>) -> Result<ScalarArcBufferRepr> {
         Ok(ScalarArcBufferRepr::from_scalar_buffer(
-            self.as_scalar_slice().to_scalar_buffer()?,
+            self.as_scalar_slice().to_scalar_buffer(mem)?,
         ))
     }
 }
@@ -311,7 +392,7 @@ pub trait ScalarDataOwned: ScalarData {
     where
         Self: Sized;
     #[doc(hidden)]
-    fn make_scalar_slice_mut(&mut self) -> Result<ScalarSliceMutRepr<'_>>;
+    fn make_scalar_slice_mut(&mut self, mem: Mem<'_>) -> Result<ScalarSliceMutRepr<'_>>;
 }
 
 /// [`ScalarBuffer`] representation.
@@ -365,7 +446,7 @@ impl ScalarDataOwned for ScalarBufferRepr {
     {
         buffer
     }
-    fn make_scalar_slice_mut(&mut self) -> Result<ScalarSliceMutRepr<'_>> {
+    fn make_scalar_slice_mut(&mut self, _mem: Mem<'_>) -> Result<ScalarSliceMutRepr<'_>> {
         Ok(self.as_scalar_slice_mut())
     }
 }
@@ -379,11 +460,8 @@ pub struct ScalarSliceRepr<'a> {
 }
 
 impl<'a> ScalarSliceRepr<'a> {
-    fn to_scalar_buffer(&self) -> Result<ScalarBufferRepr> {
-        Ok(ScalarSlice { data: self.clone() }.to_owned()?.data)
-    }
-    fn to_device(&self, device: Device) -> Result<ScalarBufferRepr> {
-        Ok(ScalarSlice { data: self.clone() }.to_device(device)?.data)
+    fn to_scalar_buffer(&self, mem: Mem<'_>) -> Result<ScalarBufferRepr> {
+        Ok(ScalarSlice { data: self.clone() }.to_owned(mem)?.data)
     }
     fn bitcast(
         self,
@@ -433,19 +511,10 @@ impl Serialize for ScalarSliceRepr<'_> {
         use serde::ser::{Error, SerializeSeq, SerializeTupleStruct};
 
         let scalar_type = self.scalar_type;
-        let slice: ScalarCowBufferRepr = if self.device().is_host() {
-            self.clone().into()
-        } else {
-            self.to_device(Device::host())
-                .map_err(S::Error::custom)?
-                .into()
-        };
-        let slice = slice.as_scalar_slice();
-        let slice = SliceRepr::<u8>::try_from(slice.bitcast(ScalarType::U8).unwrap())
-            .ok()
-            .unwrap();
+        let mapping = Mapping::new(&self.raw, false, true).map_err(S::Error::custom)?;
+        // SAFETY: The mapping retains read access to initialized bytes.
         let data = BufferData {
-            bytes: slice.as_host_slice().unwrap(),
+            bytes: unsafe { std::slice::from_raw_parts(mapping.ptr(), self.raw.len()) },
         };
         let mut tuple_struct = serializer.serialize_tuple_struct("Buffer", 3)?;
         tuple_struct.serialize_field(&scalar_type)?;
@@ -710,7 +779,7 @@ impl ScalarData for ScalarArcBufferRepr {
     fn try_into_scalar_arc_buffer(self) -> Result<Self, Self> {
         Ok(self)
     }
-    fn to_scalar_arc_buffer(&self) -> Result<Self> {
+    fn to_scalar_arc_buffer(&self, _mem: Mem<'_>) -> Result<Self> {
         Ok(self.clone())
     }
 }
@@ -723,7 +792,7 @@ impl ScalarDataOwned for ScalarArcBufferRepr {
             scalar_type: buffer.scalar_type,
         }
     }
-    fn make_scalar_slice_mut(&mut self) -> Result<ScalarSliceMutRepr<'_>> {
+    fn make_scalar_slice_mut(&mut self, mem: Mem<'_>) -> Result<ScalarSliceMutRepr<'_>> {
         if let Some(raw) = Arc::get_mut(&mut self.raw) {
             return Ok(ScalarSliceMutRepr {
                 raw: raw.slice.clone(),
@@ -733,7 +802,7 @@ impl ScalarDataOwned for ScalarArcBufferRepr {
         }
         #[allow(clippy::arc_with_non_send_sync)]
         {
-            self.raw = Arc::new(self.as_scalar_slice().to_scalar_buffer()?.raw);
+            self.raw = Arc::new(self.as_scalar_slice().to_scalar_buffer(mem)?.raw);
         }
         Ok(ScalarSliceMutRepr {
             raw: self.raw.slice.clone(),
@@ -803,13 +872,13 @@ impl<'a> ScalarDataOwned for ScalarCowBufferRepr<'a> {
     {
         Self::Owned(buffer)
     }
-    fn make_scalar_slice_mut(&mut self) -> Result<ScalarSliceMutRepr<'_>> {
+    fn make_scalar_slice_mut(&mut self, mem: Mem<'_>) -> Result<ScalarSliceMutRepr<'_>> {
         match self {
             Self::Borrowed(slice) => {
-                *self = Self::Owned(slice.to_scalar_buffer()?);
+                *self = Self::Owned(slice.to_scalar_buffer(mem)?);
                 Ok(self.get_scalar_slice_mut().unwrap())
             }
-            Self::Owned(buffer) => buffer.make_scalar_slice_mut(),
+            Self::Owned(buffer) => buffer.make_scalar_slice_mut(mem),
         }
     }
 }
@@ -860,11 +929,11 @@ impl<S: ScalarDataOwned> ScalarBufferBase<S> {
     /// - [`OutOfDeviceMemory`]
     ///
     /// See [`ScalarBufferBase::zeros()`] for a safe alternative.
-    pub unsafe fn uninit(device: Device, len: usize, scalar_type: ScalarType) -> Result<Self> {
+    pub unsafe fn uninit(mem: Mem<'_>, len: usize, scalar_type: ScalarType) -> Result<Self> {
         macro_wrap!(paste! {
             match scalar_type {
                 macro_for!($T in [u8, i8, u16, i16, f16, bf16, u32, i32, f32, u64, i64, f64] {
-                    ScalarType::[<$T:upper>] => Ok(unsafe { Buffer::<$T>::uninit(device, len)? }.into()),
+                    ScalarType::[<$T:upper>] => Ok(unsafe { Buffer::<$T>::uninit(mem, len)? }.into()),
                 })
                 _ => unreachable!(),
             }
@@ -881,11 +950,11 @@ impl<S: ScalarDataOwned> ScalarBufferBase<S> {
 
     See [.fill()](ScalarBufferBase::fill).
      */
-    pub fn from_elem(device: Device, len: usize, elem: ScalarElem) -> Result<Self> {
+    pub fn from_elem(mem: Mem<'_>, len: usize, elem: ScalarElem) -> Result<Self> {
         macro_wrap!(paste! {
             match elem {
                 macro_for!($T in [u8, i8, u16, i16, f16, bf16, u32, i32, f32, u64, i64, f64] {
-                  ScalarElem::[<$T:upper>](elem) => Ok(Buffer::from_elem(device, len, elem)?.into()),
+                  ScalarElem::[<$T:upper>](elem) => Ok(Buffer::from_elem(mem, len, elem)?.into()),
                 })
                 _ => unreachable!(),
             }
@@ -894,14 +963,14 @@ impl<S: ScalarDataOwned> ScalarBufferBase<S> {
     /** Create a scalar buffer filled with 0's.
 
     See [`from_elem`](ScalarBufferBase::from_elem). */
-    pub fn zeros(device: Device, len: usize, scalar_type: ScalarType) -> Result<Self> {
-        Self::from_elem(device, len, ScalarElem::zero(scalar_type))
+    pub fn zeros(mem: Mem<'_>, len: usize, scalar_type: ScalarType) -> Result<Self> {
+        Self::from_elem(mem, len, ScalarElem::zero(scalar_type))
     }
     /** Create a scalar buffer filled with 1's.
 
     See [`from_elem`](ScalarBufferBase::from_elem). */
-    pub fn ones(device: Device, len: usize, scalar_type: ScalarType) -> Result<Self> {
-        Self::from_elem(device, len, ScalarElem::one(scalar_type))
+    pub fn ones(mem: Mem<'_>, len: usize, scalar_type: ScalarType) -> Result<Self> {
+        Self::from_elem(mem, len, ScalarElem::one(scalar_type))
     }
     /// Create a scalar buffer from a [`ScalarBuffer`].
     pub fn from_scalar_buffer(buffer: ScalarBuffer) -> Self {
@@ -914,6 +983,14 @@ impl<S: ScalarData> ScalarBufferBase<S> {
     /// The device.
     pub fn device(&self) -> Device {
         self.data.device()
+    }
+    /// Returns the selected Vulkan memory properties, if an allocation exists.
+    pub fn memory_properties(&self) -> Option<MemoryProperties> {
+        self.data.as_scalar_slice().raw.memory_properties()
+    }
+    /// Reports whether this storage supports CPU mapping.
+    pub fn is_host_visible(&self) -> bool {
+        self.data.as_scalar_slice().raw.is_host_visible()
     }
     /// The scalar_type.
     pub fn scalar_type(&self) -> ScalarType {
@@ -946,113 +1023,54 @@ impl<S: ScalarData> ScalarBufferBase<S> {
             data: self.data.get_scalar_slice_mut()?,
         })
     }
-    /// Borrows as a mutable scalar slice, cloning if necessary.
-    pub fn make_scalar_slice_mut(&mut self) -> Result<ScalarSliceMut<'_>>
+    /// Borrows as a mutable scalar slice. Uses `mem` if a copy is needed.
+    pub fn make_scalar_slice_mut(&mut self, mem: Mem<'_>) -> Result<ScalarSliceMut<'_>>
     where
         S: ScalarDataOwned,
     {
         Ok(ScalarSliceMut {
-            data: self.data.make_scalar_slice_mut()?,
+            data: self.data.make_scalar_slice_mut(mem)?,
         })
     }
-    /** Move into an owned scalar buffer.
-
-    Avoids copying if possible.
-
-    See [`.to_owned()`](ScalarBufferBase::to_owned). */
-    pub fn into_owned(self) -> Result<ScalarBuffer> {
-        match self.data.try_into_scalar_buffer() {
-            Ok(data) => Ok(ScalarBuffer { data }),
-            Err(data) => Self { data }.to_owned(),
-        }
-    }
-    /** Copies to an owned scalar buffer.
-
-    # Errors
-    - [`DeviceLost`]
-    - [`OutOfDeviceMemory`]
-    - Could not dispatch the kernel. */
-    pub fn to_owned(&self) -> Result<ScalarBuffer> {
-        self.cast(self.scalar_type())
-    }
-    /** Moves into a scalar arc buffer.
-
-    Avoids copying if possible.
-
-    See [`.to_shared()`](ScalarBufferBase::to_shared). */
-    pub fn into_shared(self) -> Result<ScalarArcBuffer> {
-        let data = match self.data.try_into_scalar_arc_buffer() {
-            Ok(data) => data,
-            Err(data) => data.to_scalar_arc_buffer()?,
-        };
-        Ok(ScalarArcBuffer { data })
-    }
-    /** Copies or clones to a scalar arc buffer.
-
-    ScalarArcBuffer can be cheaply cloned.
-
-    See [`.to_owned`](ScalarBufferBase::to_owned). */
-    pub fn to_shared(&self) -> Result<ScalarArcBuffer> {
-        let data = self.data.to_scalar_arc_buffer()?;
-        Ok(ScalarArcBuffer { data })
-    }
-    /** Moves the buffer to the device.
-
-    Avoids copying if possible.
-
-    See [`.to_device()`](ScalarBufferBase::to_device). */
-    pub fn into_device(self, device: Device) -> Result<ScalarBuffer> {
-        if device == self.device() {
-            self.into_owned()
-        } else {
-            self.to_device(device)
-        }
-    }
-    /** Moves the buffer to the device as a scalar arc buffer
-
-    ScalarArcBuffer can be cheeply cloned.
-
-    See [`.into_device()`](ScalarBufferBase::into_device). */
-    pub fn into_device_shared(self, device: Device) -> Result<ScalarArcBuffer> {
-        if device == self.device() {
-            self.into_shared()
-        } else {
-            self.to_device(device).map(Into::into)
-        }
-    }
-    /** Copies to the device.
-
-    See [`BufferBase::to_device`]. */
-    pub fn to_device(&self, device: Device) -> Result<ScalarBuffer> {
+    /// Copies into the requested memory.
+    pub fn to_owned(&self, mem: Mem<'_>) -> Result<ScalarBuffer> {
         let slice = self.as_scalar_slice();
         macro_wrap!(paste! { match slice.scalar_type() {
             macro_for!($T in [u8, i8, u16, i16, f16, bf16, u32, i32, f32, u64, i64, f64] {
-                ScalarType::[<$T:upper>] => Ok(Slice::<$T>::try_from(slice).ok().unwrap().to_device(device)?.into()),
+                ScalarType::[<$T:upper>] => Ok(Slice::<$T>::try_from(slice).ok().unwrap().to_owned(mem)?.into()),
             })
             _ => unreachable!(),
         }})
     }
-    /** Copies to the device in place.
-
-    See [`.to_device()`](BufferBase::to_device). */
-    pub fn to_device_mut(&mut self, device: Device) -> Result<()>
-    where
-        S: ScalarDataOwned,
-    {
-        if self.device() != device {
-            self.data = S::from_scalar_buffer(self.data.as_scalar_slice().to_device(device)?);
+    /// Reuses owned storage if it matches `mem`. Copies otherwise.
+    pub fn into_owned(self, mem: Mem<'_>) -> Result<ScalarBuffer> {
+        if !self.data.as_scalar_slice().raw.matches(mem)? {
+            return self.to_owned(mem);
         }
-        Ok(())
+        match self.data.try_into_scalar_buffer() {
+            Ok(data) => Ok(ScalarBuffer { data }),
+            Err(data) => Self { data }.to_owned(mem),
+        }
     }
-    /** Copies to the device as a scalar arc buffer.
-
-    See [`.to_device()`](ScalarBufferBase::to_device). */
-    pub fn to_device_shared(&self, device: Device) -> Result<ScalarArcBuffer> {
-        if device == self.device() {
-            self.to_shared()
-        } else {
-            self.to_device(device).map(Into::into)
+    /// Reuses storage when possible and returns shared ownership.
+    pub fn into_shared(self, mem: Mem<'_>) -> Result<ScalarArcBuffer> {
+        if !self.data.as_scalar_slice().raw.matches(mem)? {
+            return self.to_owned(mem).map(Into::into);
         }
+        let data = match self.data.try_into_scalar_arc_buffer() {
+            Ok(data) => data,
+            Err(data) => data.to_scalar_arc_buffer(mem)?,
+        };
+        Ok(ScalarArcBuffer { data })
+    }
+    /// Clones shared storage if it matches `mem`. Copies otherwise.
+    pub fn to_shared(&self, mem: Mem<'_>) -> Result<ScalarArcBuffer> {
+        if !self.data.as_scalar_slice().raw.matches(mem)? {
+            return self.to_owned(mem).map(Into::into);
+        }
+        Ok(ScalarArcBuffer {
+            data: self.data.to_scalar_arc_buffer(mem)?,
+        })
     }
     /** Fills the buffer with `elem`.
 
@@ -1075,14 +1093,14 @@ impl<S: ScalarData> ScalarBufferBase<S> {
     /** Casts to `scalar_type`.
 
     See [`BufferBase::cast`]. */
-    pub fn cast(&self, scalar_type: ScalarType) -> Result<ScalarBuffer> {
+    pub fn cast(&self, mem: Mem<'_>, scalar_type: ScalarType) -> Result<ScalarBuffer> {
         macro_for!($X in [u8, i8, u16, i16, f16, bf16, u32, i32, f32, u64, i64, f64] {
             if let Ok(x) = Slice::<$X>::try_from(self.as_scalar_slice()) {
                 macro_wrap!(paste! {
                     match scalar_type {
                         macro_for!($Y in [u8, i8, u16, i16, f16, bf16, u32, i32, f32, u64, i64, f64] {
                             ScalarType::[<$Y:upper>] => {
-                                return x.cast::<$Y>().map(Into::into);
+                                return x.cast::<$Y>(mem).map(Into::into);
                             }
                         })
                         _ => (),
@@ -1095,21 +1113,21 @@ impl<S: ScalarData> ScalarBufferBase<S> {
     /** Casts into `scalar_type`.
 
     See [`.cast()`](ScalarBufferBase::cast). */
-    pub fn cast_into(self, scalar_type: ScalarType) -> Result<ScalarBuffer> {
+    pub fn cast_into(self, mem: Mem<'_>, scalar_type: ScalarType) -> Result<ScalarBuffer> {
         if self.scalar_type() == scalar_type {
-            self.into_owned()
+            self.into_owned(mem)
         } else {
-            self.cast(scalar_type)
+            self.cast(mem, scalar_type)
         }
     }
     /** Casts into `scalar_type` as a scalar arc buffer.
 
     See [`.cast()`](ScalarBufferBase::cast). */
-    pub fn cast_shared(&self, scalar_type: ScalarType) -> Result<ScalarArcBuffer> {
+    pub fn cast_shared(&self, mem: Mem<'_>, scalar_type: ScalarType) -> Result<ScalarArcBuffer> {
         if self.scalar_type() == scalar_type {
-            self.to_shared()
+            self.to_shared(mem)
         } else {
-            self.cast(scalar_type).map(Into::into)
+            self.cast(mem, scalar_type).map(Into::into)
         }
     }
     /** Reinterpret as a slice with `scalar_type`.
@@ -1329,11 +1347,11 @@ pub trait Data: ScalarData {
         }
     }
     #[doc(hidden)]
-    fn to_arc_buffer(&self) -> Result<ArcBufferRepr<Self::Elem>>
+    fn to_arc_buffer(&self, mem: Mem<'_>) -> Result<ArcBufferRepr<Self::Elem>>
     where
         Self: Sized,
     {
-        Ok(ArcBufferRepr::from_buffer(self.as_slice().to_buffer()?))
+        Ok(ArcBufferRepr::from_buffer(self.as_slice().to_buffer(mem)?))
     }
 }
 
@@ -1352,7 +1370,7 @@ pub trait DataOwned: Data {
     #[doc(hidden)]
     fn from_buffer(buffer: BufferRepr<Self::Elem>) -> Self;
     #[doc(hidden)]
-    fn make_slice_mut(&mut self) -> Result<SliceMutRepr<'_, Self::Elem>>;
+    fn make_slice_mut(&mut self, mem: Mem<'_>) -> Result<SliceMutRepr<'_, Self::Elem>>;
 }
 
 /// [`Buffer`] representation.
@@ -1362,9 +1380,9 @@ pub struct BufferRepr<T> {
 }
 
 impl<T: Scalar> BufferRepr<T> {
-    fn from_vec(vec: Vec<T>) -> Self {
+    fn from_vec(mut vec: Vec<T>) -> Self {
         let width = std::mem::size_of::<T>();
-        let ptr = vec.as_ptr() as *mut u8;
+        let ptr = vec.as_mut_ptr().cast();
         let len = vec.len() * width;
         let cap = vec.capacity() * width;
         forget(vec);
@@ -1380,21 +1398,37 @@ impl<T: Scalar> BufferRepr<T> {
             _m: PhantomData,
         }
     }
-    unsafe fn uninit(device: Device, len: usize) -> Result<Self> {
+    unsafe fn uninit(mem: Mem<'_>, len: usize) -> Result<Self> {
+        let device = mem.device()?;
+        let bytes = len
+            .checked_mul(size_of::<T>())
+            .ok_or_else(|| anyhow::anyhow!("Buffer size overflow."))?;
         match device.inner() {
             DeviceInner::Host => {
-                let mut vec = Vec::with_capacity(len);
-                #[allow(clippy::uninit_vec)]
-                unsafe {
-                    vec.set_len(len);
-                }
-                Ok(Self::from_vec(vec))
+                let mut vec = Vec::<std::mem::MaybeUninit<T>>::new();
+                vec.try_reserve_exact(len)?;
+                let raw = RawBuffer {
+                    slice: RawSlice {
+                        inner: RawSliceInner::Host(RawHostSlice {
+                            ptr: vec.as_mut_ptr().cast(),
+                            len: bytes,
+                        }),
+                    },
+                    cap: vec.capacity() * size_of::<T>(),
+                    width: size_of::<T>(),
+                };
+                forget(vec);
+                Ok(Self {
+                    raw,
+                    _m: PhantomData,
+                })
             }
             #[cfg(feature = "device")]
             DeviceInner::Device(device) => {
                 let width = size_of::<T>();
-                let cap = len * width;
-                let device_buffer = unsafe { DeviceBuffer::uninit(device.clone(), cap)? };
+                let cap = bytes;
+                let device_buffer =
+                    unsafe { DeviceBuffer::uninit(device.clone(), cap, mem.kind())? };
                 let raw = RawBuffer {
                     slice: RawSlice {
                         inner: RawSliceInner::Device(device_buffer),
@@ -1484,7 +1518,7 @@ impl<T: Scalar> DataOwned for BufferRepr<T> {
     fn from_buffer(buffer: Self) -> Self {
         buffer
     }
-    fn make_slice_mut(&mut self) -> Result<SliceMutRepr<'_, T>> {
+    fn make_slice_mut(&mut self, _mem: Mem<'_>) -> Result<SliceMutRepr<'_, T>> {
         Ok(self.as_slice_mut())
     }
 }
@@ -1537,15 +1571,16 @@ impl<'a, T: Scalar> SliceRepr<'a, T> {
         if let Some(slice) = self.as_host_slice() {
             Ok(slice.to_vec())
         } else {
-            self.to_device(Device::host())?.into_vec()
+            self.copy_to(Mem::Host)?.into_vec()
         }
     }
-    fn to_buffer(&self) -> Result<BufferRepr<T>> {
-        self.to_device(self.device())
+    fn to_buffer(&self, mem: Mem<'_>) -> Result<BufferRepr<T>> {
+        self.copy_to(mem)
     }
-    fn to_device(&self, device: Device) -> Result<BufferRepr<T>> {
-        let mut output = unsafe { BufferRepr::uninit(device, self.len())? };
+    fn copy_to(&self, mem: Mem<'_>) -> Result<BufferRepr<T>> {
+        let mut output = unsafe { BufferRepr::uninit(mem, self.len())? };
         output.as_slice_mut().copy_from_slice(self)?;
+        output.device().wait()?;
         Ok(output)
     }
     fn bitcast<Y: Scalar>(self) -> Result<SliceRepr<'a, Y>, bytemuck::PodCastError> {
@@ -1602,7 +1637,7 @@ pub struct SliceMutRepr<'a, T> {
 
 impl<'a, T: Scalar> SliceMutRepr<'a, T> {
     fn from_host_slice_mut(host_slice: &'a mut [T]) -> Self {
-        let ptr = host_slice.as_ptr() as *mut u8;
+        let ptr = host_slice.as_mut_ptr().cast();
         let len = std::mem::size_of_val(host_slice);
         let raw = RawSlice {
             inner: RawSliceInner::Host(RawHostSlice { ptr, len }),
@@ -1635,13 +1670,13 @@ impl<'a, T: Scalar> SliceMutRepr<'a, T> {
         match (&mut self.raw.inner, &src.raw.inner) {
             (RawSliceInner::Host(dst), RawSliceInner::Host(src)) => {
                 unsafe {
-                    dst.as_bytes_mut().copy_from_slice(src.as_bytes());
+                    std::ptr::copy(src.ptr, dst.ptr, src.len);
                 }
                 Ok(())
             }
             #[cfg(feature = "device")]
             (RawSliceInner::Host(dst), RawSliceInner::Device(src)) => {
-                src.download(unsafe { dst.as_bytes_mut() })
+                src.download(unsafe { dst.as_uninit_bytes() })
             }
             #[cfg(feature = "device")]
             (RawSliceInner::Device(dst), RawSliceInner::Host(src)) => {
@@ -1652,12 +1687,7 @@ impl<'a, T: Scalar> SliceMutRepr<'a, T> {
                 if dst.device() != src_buffer.device() {
                     return src_buffer.transfer(dst);
                 }
-                Slice { data: src.clone() }.cast_impl(&mut SliceMut::<T> {
-                    data: SliceMutRepr {
-                        raw: self.raw.clone(),
-                        _m: PhantomData,
-                    },
-                })
+                src_buffer.copy(dst)
             }
         }
     }
@@ -1773,7 +1803,7 @@ impl<T: Scalar> ScalarData for ArcBufferRepr<T> {
     fn try_into_scalar_arc_buffer(self) -> Result<ScalarArcBufferRepr, Self> {
         self.try_into_arc_buffer().map(Into::into)
     }
-    fn to_scalar_arc_buffer(&self) -> Result<ScalarArcBufferRepr> {
+    fn to_scalar_arc_buffer(&self, _mem: Mem<'_>) -> Result<ScalarArcBufferRepr> {
         Ok(self.clone().into())
     }
 }
@@ -1811,7 +1841,7 @@ impl<T: Scalar> Data for ArcBufferRepr<T> {
     {
         Ok(self)
     }
-    fn to_arc_buffer(&self) -> Result<Self> {
+    fn to_arc_buffer(&self, _mem: Mem<'_>) -> Result<Self> {
         Ok(self.clone())
     }
 }
@@ -1824,7 +1854,7 @@ impl<T: Scalar> DataOwned for ArcBufferRepr<T> {
             _m: PhantomData,
         }
     }
-    fn make_slice_mut(&mut self) -> Result<SliceMutRepr<'_, T>> {
+    fn make_slice_mut(&mut self, mem: Mem<'_>) -> Result<SliceMutRepr<'_, T>> {
         if let Some(raw) = Arc::get_mut(&mut self.raw) {
             return Ok(SliceMutRepr {
                 raw: raw.slice.clone(),
@@ -1833,7 +1863,7 @@ impl<T: Scalar> DataOwned for ArcBufferRepr<T> {
         }
         #[allow(clippy::arc_with_non_send_sync)]
         {
-            self.raw = Arc::new(self.as_slice().to_buffer()?.raw);
+            self.raw = Arc::new(self.as_slice().to_buffer(mem)?.raw);
         }
         Ok(SliceMutRepr {
             raw: self.raw.slice.clone(),
@@ -1914,13 +1944,13 @@ impl<'a, T: Scalar> DataOwned for CowBufferRepr<'a, T> {
     fn from_buffer(buffer: BufferRepr<T>) -> Self {
         Self::Owned(buffer)
     }
-    fn make_slice_mut(&mut self) -> Result<SliceMutRepr<'_, T>> {
+    fn make_slice_mut(&mut self, mem: Mem<'_>) -> Result<SliceMutRepr<'_, T>> {
         match self {
             Self::Borrowed(slice) => {
-                *self = Self::Owned(slice.to_buffer()?);
+                *self = Self::Owned(slice.to_buffer(mem)?);
                 Ok(self.get_slice_mut().unwrap())
             }
-            Self::Owned(buffer) => buffer.make_slice_mut(),
+            Self::Owned(buffer) => buffer.make_slice_mut(mem),
         }
     }
 }
@@ -1961,7 +1991,7 @@ pub type CowBuffer<'a, T> = BufferBase<CowBufferRepr<'a, T>>;
 
 impl<T: Scalar, S: DataOwned<Elem = T>> From<Vec<T>> for BufferBase<S> {
     fn from(vec: Vec<T>) -> Self {
-        Self::from_vec(vec)
+        Self::from_host_vec(vec)
     }
 }
 
@@ -2053,7 +2083,7 @@ impl<'a, T: Scalar> TryFrom<ScalarCowBuffer<'a>> for CowBuffer<'a, T> {
 
 impl<T: Scalar, S: DataOwned<Elem = T>> Default for BufferBase<S> {
     fn default() -> Self {
-        Self::zeros(Device::host(), 0).unwrap()
+        Self::zeros(Mem::Host, 0).unwrap()
     }
 }
 
@@ -2069,8 +2099,8 @@ impl<T: Scalar, S: DataOwned<Elem = T>> BufferBase<S> {
     /// - [`OutOfDeviceMemory`]
     ///
     /// See [`zeros()`](Buffer::zeros) for a safe alternative.
-    pub unsafe fn uninit(device: Device, len: usize) -> Result<Self> {
-        let data = S::from_buffer(unsafe { BufferRepr::uninit(device, len)? });
+    pub unsafe fn uninit(mem: Mem<'_>, len: usize) -> Result<Self> {
+        let data = S::from_buffer(unsafe { BufferRepr::uninit(mem, len)? });
         Ok(Self { data })
     }
     /** Create a buffer filled with `elem`
@@ -2082,9 +2112,13 @@ impl<T: Scalar, S: DataOwned<Elem = T>> BufferBase<S> {
 
     See [`.fill()`](BufferBase::fill).
     */
-    pub fn from_elem(device: Device, len: usize, elem: T) -> Result<Self> {
-        let mut output = unsafe { Buffer::uninit(device, len)? };
+    pub fn from_elem(mem: Mem<'_>, len: usize, elem: T) -> Result<Self> {
+        if !matches!(mem, Mem::Device(_)) {
+            return Self::allocate_with(mem, len, |_| elem);
+        }
+        let mut output = unsafe { Buffer::uninit(mem, len)? };
         output.fill(elem)?;
+        output.device().wait()?;
         Ok(Self {
             data: S::from_buffer(output.data),
         })
@@ -2092,17 +2126,41 @@ impl<T: Scalar, S: DataOwned<Elem = T>> BufferBase<S> {
     /** Create a buffer filled with 0's.
 
     See [`from_elem`](BufferBase::from_elem). */
-    pub fn zeros(device: Device, len: usize) -> Result<Self> {
-        Self::from_elem(device, len, T::zero())
+    pub fn zeros(mem: Mem<'_>, len: usize) -> Result<Self> {
+        Self::from_elem(mem, len, T::zero())
     }
     /** Create a buffer filled with 1's.
 
     See [`from_elem`](BufferBase::from_elem). */
-    pub fn ones(device: Device, len: usize) -> Result<Self> {
-        Self::from_elem(device, len, T::one())
+    pub fn ones(mem: Mem<'_>, len: usize) -> Result<Self> {
+        Self::from_elem(mem, len, T::one())
     }
-    /// Create a buffer from a [`Vec`].
-    pub fn from_vec(vec: Vec<T>) -> Self {
+    /// Initializes CPU-accessible storage directly, in index order.
+    pub fn allocate_with(
+        mem: Mem<'_>,
+        len: usize,
+        mut init: impl FnMut(usize) -> T,
+    ) -> Result<Self> {
+        if matches!(mem, Mem::Device(_)) {
+            bail!("Use a mapped placement for allocate_with.");
+        }
+        let output = unsafe { BufferRepr::<T>::uninit(mem, len)? };
+        {
+            let mapping = Mapping::new(&output.raw.slice, true, true)?;
+            let ptr = mapping.ptr().cast::<T>();
+            for i in 0..len {
+                // SAFETY: Each slot lies in the allocation and is written before exposure.
+                unsafe {
+                    ptr.add(i).write(init(i));
+                }
+            }
+        }
+        Ok(Self {
+            data: S::from_buffer(output),
+        })
+    }
+    /// Adopts a host vector without copying.
+    pub fn from_host_vec(vec: Vec<T>) -> Self {
         let data = S::from_buffer(BufferRepr::from_vec(vec));
         Self { data }
     }
@@ -2165,13 +2223,13 @@ impl<T: Scalar, S: Data<Elem = T>> BufferBase<S> {
             data: self.data.get_slice_mut()?,
         })
     }
-    /// Borrows as a mutable slice, cloning if necessary.
-    pub fn make_slice_mut(&mut self) -> Result<SliceMut<'_, T>>
+    /// Borrows as a mutable slice. Uses `mem` if a copy is needed.
+    pub fn make_slice_mut(&mut self, mem: Mem<'_>) -> Result<SliceMut<'_, T>>
     where
         S: DataOwned,
     {
         Ok(SliceMut {
-            data: self.data.make_slice_mut()?,
+            data: self.data.make_slice_mut(mem)?,
         })
     }
     /** Borrow as a host slice.
@@ -2202,107 +2260,98 @@ impl<T: Scalar, S: Data<Elem = T>> BufferBase<S> {
         let data = self.data.as_scalar_slice_mut();
         ScalarSliceMut { data }
     }
-    /** Moves into a buffer.
-
-    See [`.to_owned()`](BufferBase::to_owned). */
-    pub fn into_owned(self) -> Result<Buffer<T>> {
+    /// Copies into the requested memory.
+    pub fn to_owned(&self, mem: Mem<'_>) -> Result<Buffer<T>> {
+        Ok(Buffer {
+            data: self.data.as_slice().copy_to(mem)?,
+        })
+    }
+    /// Reuses owned storage if it matches `mem`. Copies otherwise.
+    pub fn into_owned(self, mem: Mem<'_>) -> Result<Buffer<T>> {
+        if !self.data.as_slice().raw.matches(mem)? {
+            return self.to_owned(mem);
+        }
         match self.data.try_into_buffer() {
             Ok(data) => Ok(Buffer { data }),
-            Err(data) => Self { data }.to_owned(),
+            Err(data) => Self { data }.to_owned(mem),
         }
     }
-    /** Copies to a buffer.
-
-    # Errors
-    - [`DeviceLost`]
-    - [`OutOfDeviceMemory`]
-    - Could not dispatch the kernel. */
-    pub fn to_owned(&self) -> Result<Buffer<T>> {
-        self.cast()
-    }
-    /** Moves into an arc buffer.
-
-    See [`.to_shared()`](BufferBase::into_shared) */
-    pub fn into_shared(self) -> Result<ArcBuffer<T>> {
+    /// Reuses storage when possible and returns shared ownership.
+    pub fn into_shared(self, mem: Mem<'_>) -> Result<ArcBuffer<T>> {
+        if !self.data.as_slice().raw.matches(mem)? {
+            return self.to_owned(mem).map(Into::into);
+        }
         let data = match self.data.try_into_arc_buffer() {
             Ok(data) => data,
-            Err(data) => data.to_arc_buffer()?,
+            Err(data) => data.to_arc_buffer(mem)?,
         };
         Ok(ArcBuffer { data })
     }
-    /** Copies or clones to an arc buffer.
-
-    See [`.to_owned`](BufferBase::to_owned). */
-    pub fn to_shared(&self) -> Result<ArcBuffer<T>> {
-        let data = self.data.to_arc_buffer()?;
-        Ok(ArcBuffer { data })
-    }
-    /** Moves into the device.
-
-    See [`.into_device()`](BufferBase::into_device). */
-    pub fn into_device(self, device: Device) -> Result<Buffer<T>> {
-        if device == self.device() {
-            self.into_owned()
-        } else {
-            self.to_device(device)
+    /// Clones shared storage if it matches `mem`. Copies otherwise.
+    pub fn to_shared(&self, mem: Mem<'_>) -> Result<ArcBuffer<T>> {
+        if !self.data.as_slice().raw.matches(mem)? {
+            return self.to_owned(mem).map(Into::into);
         }
+        Ok(ArcBuffer {
+            data: self.data.to_arc_buffer(mem)?,
+        })
     }
-    /** Moves into the device as an arc buffer.
-
-    See [`.into_device()`](BufferBase::into_device). */
-    pub fn into_device_shared(self, device: Device) -> Result<ArcBuffer<T>> {
-        if device == self.device() {
-            self.into_shared()
-        } else {
-            self.to_device(device).map(Into::into)
-        }
-    }
-    /** Copies to the device.
-
-    # Errors
-    - [`DeviceLost`]
-    - [`OutOfDeviceMemory`]
-    - Could not dispatch the kernel. */
-    pub fn to_device(&self, device: Device) -> Result<Buffer<T>> {
-        let data = self.data.as_slice().to_device(device)?;
-        Ok(Buffer { data })
-    }
-    /** Copies to the device in place.
-
-    See [`.to_device()`](BufferBase::to_device). */
-    pub fn to_device_mut(&mut self, device: Device) -> Result<()>
-    where
-        S: DataOwned,
-    {
-        if self.device() != device {
-            self.data = S::from_buffer(self.data.as_slice().to_device(device)?);
-        }
-        Ok(())
-    }
-    /** Copies to the device as an arc buffer.
-
-    See [`.to_device()`](BufferBase::to_device). */
-    pub fn to_device_shared(&self, device: Device) -> Result<ArcBuffer<T>> {
-        if device == self.device() {
-            self.to_shared()
-        } else {
-            self.to_device(device).map(Into::into)
-        }
-    }
-    /** Moves into a [`Vec`].
-
-    See [`.into_device()`](BufferBase::into_device) */
-    pub fn into_vec(self) -> Result<Vec<T>> {
+    /// Returns host storage, copying if the allocation cannot become a `Vec`.
+    pub fn into_host_vec(self) -> Result<Vec<T>> {
         match self.data.try_into_buffer() {
             Ok(data) => data.into_vec(),
             Err(data) => data.as_slice().to_vec(),
         }
     }
-    /** Copies to a [`Vec`].
-
-    See [`.to_device()`](BufferBase::to_device). */
-    pub fn to_vec(&self) -> Result<Vec<T>> {
+    /// Copies into a host vector.
+    pub fn to_host_vec(&self) -> Result<Vec<T>> {
         self.data.as_slice().to_vec()
+    }
+
+    /// Waits for GPU work and reserves CPU read access.
+    pub fn map_read(&self) -> Result<ReadGuard<'_, T>> {
+        self.map_read_impl(true)
+    }
+    /// Reserves CPU read access without waiting for GPU work.
+    pub fn try_map_read(&self) -> Result<ReadGuard<'_, T>> {
+        self.map_read_impl(false)
+    }
+    fn map_read_impl(&self, wait: bool) -> Result<ReadGuard<'_, T>> {
+        Ok(ReadGuard {
+            mapping: Mapping::new(&self.data.as_slice().raw, false, wait)?,
+            _borrow: PhantomData,
+        })
+    }
+    /// Waits for GPU work and reserves exclusive CPU access.
+    pub fn map_write(&mut self) -> Result<WriteGuard<'_, T>>
+    where
+        S: DataMut,
+    {
+        self.map_write_impl(true)
+    }
+    /// Reserves exclusive CPU access without waiting for GPU work.
+    pub fn try_map_write(&mut self) -> Result<WriteGuard<'_, T>>
+    where
+        S: DataMut,
+    {
+        self.map_write_impl(false)
+    }
+    fn map_write_impl(&mut self, wait: bool) -> Result<WriteGuard<'_, T>>
+    where
+        S: DataMut,
+    {
+        Ok(WriteGuard {
+            mapping: Mapping::new(&self.data.as_slice_mut().raw, true, wait)?,
+            _borrow: PhantomData,
+        })
+    }
+    /// Returns the selected Vulkan memory properties, if an allocation exists.
+    pub fn memory_properties(&self) -> Option<MemoryProperties> {
+        self.data.as_slice().raw.memory_properties()
+    }
+    /// Whether this allocation supports CPU mapping.
+    pub fn is_host_visible(&self) -> bool {
+        self.data.as_slice().raw.is_host_visible()
     }
     /** Fills with `elem`.
 
@@ -2381,35 +2430,58 @@ impl<T: Scalar, S: Data<Elem = T>> BufferBase<S> {
     }
     /** Casts to `Y`.
 
+    The source and destination must use the same device.
+
     # Errors
     - [`DeviceLost`]
     - The kernel could not be dispatched.
         - This may require [`Features`] for the type. */
-    pub fn cast<Y: Scalar>(&self) -> Result<Buffer<Y>> {
-        let mut output = unsafe { Buffer::uninit(self.device(), self.len())? };
+    pub fn cast<Y: Scalar>(&self, mem: Mem<'_>) -> Result<Buffer<Y>> {
+        if self.device() != mem.device()? {
+            bail!("Copy to the target device before casting.");
+        }
+        if let Some(x) = self.as_host_slice() {
+            use half::slice::HalfFloatSliceExt;
+            macro_for!($H in [f16, bf16] {
+                if T::SCALAR_TYPE == <$H>::SCALAR_TYPE {
+                    let x = bytemuck::cast_slice::<_, $H>(x);
+                    let output = match Y::SCALAR_TYPE {
+                        ScalarType::F32 => Some(ScalarBuffer::from(Buffer::from_host_vec(x.to_f32_vec()))),
+                        ScalarType::F64 => Some(ScalarBuffer::from(Buffer::from_host_vec(x.to_f64_vec()))),
+                        _ => None,
+                    };
+                    if let Some(output) = output {
+                        return Ok(output.try_into().ok().unwrap());
+                    }
+                }
+            });
+            return Buffer::allocate_with(mem, x.len(), |i| x[i].cast());
+        }
+        let mut output = unsafe { Buffer::uninit(mem, self.len())? };
         self.as_slice().cast_impl(&mut output.as_slice_mut())?;
+        output.device().wait()?;
         Ok(output)
     }
     /** Casts into `Y`.
 
     See [`.cast()`](BufferBase::cast). */
-    pub fn cast_into<Y: Scalar>(self) -> Result<Buffer<Y>> {
+    pub fn cast_into<Y: Scalar>(self, mem: Mem<'_>) -> Result<Buffer<Y>> {
         if T::SCALAR_TYPE == Y::SCALAR_TYPE {
-            let buffer = self.into_owned()?;
+            let buffer = self.into_owned(mem)?;
             Ok(ScalarBuffer::from(buffer).try_into().ok().unwrap())
         } else {
-            self.cast()
+            self.cast(mem)
         }
     }
     /** Casts to `Y` as an arc buffer.
 
     See [`.cast()`](BufferBase::cast). */
-    pub fn cast_shared<Y: Scalar>(&self) -> Result<ArcBuffer<Y>> {
+    pub fn cast_shared<Y: Scalar>(&self, mem: Mem<'_>) -> Result<ArcBuffer<Y>> {
         if T::SCALAR_TYPE == Y::SCALAR_TYPE {
-            let buffer = self.to_shared()?;
+            let buffer = self.to_shared(mem)?;
             Ok(ScalarArcBuffer::from(buffer).try_into().ok().unwrap())
         } else {
-            self.cast().map(Into::into)
+            self.cast(mem).map(Into::into)
         }
     }
     /** Reinterpret as a slice with type `Y`.
@@ -2440,7 +2512,8 @@ impl<T: Scalar, S: Data<Elem = T>> BufferBase<S> {
     where
         S: DataMut,
     {
-        self.data.as_slice_mut().copy_from_slice(&src.data)
+        self.data.as_slice_mut().copy_from_slice(&src.data)?;
+        Ok(self.device().wait()?)
     }
     /** A subslice with `range`.
 
@@ -2469,32 +2542,6 @@ impl<T: Scalar> Slice<'_, T> {
     fn cast_impl<Y: Scalar>(&self, output: &mut SliceMut<'_, Y>) -> Result<()> {
         debug_assert_eq!(self.len(), output.len());
         if output.is_empty() {
-            return Ok(());
-        }
-        if let Some((x, y)) = self.as_host_slice().zip(output.as_host_slice_mut()) {
-            {
-                use half::slice::HalfFloatSliceExt;
-                if T::SCALAR_TYPE == ScalarType::F16 && Y::SCALAR_TYPE == ScalarType::F32 {
-                    bytemuck::cast_slice::<_, f16>(x)
-                        .convert_to_f32_slice(bytemuck::cast_slice_mut(y));
-                    return Ok(());
-                } else if T::SCALAR_TYPE == ScalarType::BF16 && Y::SCALAR_TYPE == ScalarType::F32 {
-                    bytemuck::cast_slice::<_, bf16>(x)
-                        .convert_to_f32_slice(bytemuck::cast_slice_mut(y));
-                    return Ok(());
-                } else if T::SCALAR_TYPE == ScalarType::F16 && Y::SCALAR_TYPE == ScalarType::F64 {
-                    bytemuck::cast_slice::<_, f16>(x)
-                        .convert_to_f64_slice(bytemuck::cast_slice_mut(y));
-                    return Ok(());
-                } else if T::SCALAR_TYPE == ScalarType::BF16 && Y::SCALAR_TYPE == ScalarType::F64 {
-                    bytemuck::cast_slice::<_, bf16>(x)
-                        .convert_to_f64_slice(bytemuck::cast_slice_mut(y));
-                    return Ok(());
-                }
-            }
-            for (x, y) in x.iter().zip(y.iter_mut()) {
-                *y = x.cast();
-            }
             return Ok(());
         }
         #[cfg(feature = "device")]
@@ -2627,7 +2674,7 @@ mod tests {
                 item.to_be()
             })
             .collect();
-        let buffer = Buffer::from_vec(input.clone());
+        let buffer = Buffer::from_host_vec(input.clone());
         let tokens = [
             Token::TupleStruct {
                 name: "Buffer",
@@ -2660,10 +2707,10 @@ mod tests {
     #[test]
     fn buffer_serde_json() {
         let x_vec = vec![1u32, 2, 3, 4];
-        let string = serde_json::to_string(&Buffer::from_vec(x_vec.clone())).unwrap();
+        let string = serde_json::to_string(&Buffer::from_host_vec(x_vec.clone())).unwrap();
         let y_vec = serde_json::from_str::<Buffer<u32>>(&string)
             .unwrap()
-            .into_vec()
+            .into_host_vec()
             .unwrap();
         assert_eq!(x_vec, y_vec);
     }
@@ -2671,10 +2718,10 @@ mod tests {
     #[test]
     fn buffer_serde_bincode2() {
         let x_vec = vec![1u32, 2, 3, 4];
-        let bytes = bincode2::serialize(&Buffer::from_vec(x_vec.clone())).unwrap();
+        let bytes = bincode2::serialize(&Buffer::from_host_vec(x_vec.clone())).unwrap();
         let y_vec = bincode2::deserialize::<Buffer<u32>>(&bytes)
             .unwrap()
-            .into_vec()
+            .into_host_vec()
             .unwrap();
         assert_eq!(x_vec, y_vec);
     }

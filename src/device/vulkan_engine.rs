@@ -4,7 +4,8 @@ use super::{
     DeviceOptions, Features, KernelDesc, KernelKey,
 };
 
-use anyhow::{Error, Result};
+use crate::buffer::{MapError, MemKind, MemoryProperties};
+use anyhow::{bail, Error, Result};
 use ash::vk::Handle;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use dashmap::DashMap;
@@ -17,6 +18,10 @@ use std::{
         Arc,
     },
     time::Duration,
+};
+use vulkano::{
+    buffer::BufferMemory,
+    memory::{MappedMemoryRange, MemoryPropertyFlags},
 };
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -92,11 +97,12 @@ impl Engine {
         &self,
         src: Subbuffer<[u8]>,
         dst: Subbuffer<[u8]>,
-        host_buffer: &mut HostBuffer,
-        dst_device_buffer: Option<&DeviceBuffer>,
+        host_buffer: Option<&mut HostBuffer>,
+        buffers: &[&DeviceBuffer],
     ) -> Result<()> {
+        let _access = reserve_gpu(buffers)?;
         let mut frame_outer = self.frame_outer.lock();
-        unsafe { frame_outer.transfer(&self.epoch, src, dst, host_buffer, dst_device_buffer) }
+        unsafe { frame_outer.transfer(&self.epoch, src, dst, host_buffer, buffers) }
     }
     unsafe fn compute(
         &self,
@@ -107,6 +113,8 @@ impl Engine {
         push_consts: &[u8],
         debug_printf_panic: Option<Arc<AtomicBool>>,
     ) -> Result<()> {
+        let refs: Vec<_> = buffers.iter().map(AsRef::as_ref).collect();
+        let _access = reserve_gpu(&refs)?;
         let mut frame_outer = self.frame_outer.lock();
         let new_descriptors: u32 = buffers.len().try_into().unwrap();
         if frame_outer.kernels >= Frame::MAX_KERNELS
@@ -590,8 +598,8 @@ impl FrameOuter {
         epoch: &AtomicU64,
         src: Subbuffer<[u8]>,
         dst: Subbuffer<[u8]>,
-        host_buffer: &mut HostBuffer,
-        dst_device_buffer: Option<&DeviceBuffer>,
+        host_buffer: Option<&mut HostBuffer>,
+        buffers: &[&DeviceBuffer],
     ) -> Result<()> {
         let mut frame = self.frame.lock();
         if frame.command_buffer_builder.is_none() {
@@ -604,7 +612,7 @@ impl FrameOuter {
             self.empty.store(false, Ordering::SeqCst);
         }
         unsafe {
-            frame.transfer(src, dst, host_buffer, dst_device_buffer);
+            frame.transfer(src, dst, host_buffer, buffers);
         }
         Ok(())
     }
@@ -708,8 +716,8 @@ impl Frame {
         &mut self,
         src: Subbuffer<[u8]>,
         dst: Subbuffer<[u8]>,
-        host_buffer: &mut HostBuffer,
-        dst_device_buffer: Option<&DeviceBuffer>,
+        host_buffer: Option<&mut HostBuffer>,
+        buffers: &[&DeviceBuffer],
     ) {
         let builder = self.command_buffer_builder.as_mut().unwrap();
         unsafe {
@@ -718,9 +726,11 @@ impl Frame {
                 .unwrap();
         }
         self.buffers.extend_from_slice(&[src, dst]);
-        host_buffer.epoch = self.epoch;
-        if let Some(dst_device_buffer) = dst_device_buffer {
-            dst_device_buffer.epoch.store(self.epoch, Ordering::SeqCst);
+        if let Some(host_buffer) = host_buffer {
+            host_buffer.epoch = self.epoch;
+        }
+        for buffer in buffers {
+            buffer.epoch.store(self.epoch, Ordering::SeqCst);
         }
         unsafe { self.memory_barrier() };
     }
@@ -981,6 +991,119 @@ const fn aligned_ceil(x: usize, align: usize) -> usize {
     }
 }
 
+#[derive(Default)]
+struct CpuAccess {
+    readers: usize,
+    writer: bool,
+    failed: bool,
+}
+
+fn reserve_gpu<'a>(
+    buffers: &[&'a DeviceBuffer],
+) -> Result<Vec<parking_lot::MutexGuard<'a, CpuAccess>>> {
+    let mut buffers = buffers.to_vec();
+    buffers.sort_unstable_by_key(|b| Arc::as_ptr(&b.access));
+    buffers.dedup_by_key(|b| Arc::as_ptr(&b.access));
+    let mut guards = Vec::with_capacity(buffers.len());
+    for buffer in buffers {
+        let access = buffer.access.lock();
+        if access.failed {
+            bail!("A mapped-memory cache operation failed.");
+        }
+        if access.writer || access.readers != 0 {
+            return Err(MapError::Conflict.into());
+        }
+        guards.push(access);
+    }
+    Ok(guards)
+}
+
+fn memory_filter(kind: MemKind) -> MemoryTypeFilter {
+    use MemoryPropertyFlags as F;
+    match kind {
+        MemKind::Device => MemoryTypeFilter::PREFER_DEVICE,
+        MemKind::Shared => MemoryTypeFilter {
+            required_flags: F::HOST_VISIBLE,
+            preferred_flags: F::DEVICE_LOCAL | F::HOST_CACHED,
+            ..MemoryTypeFilter::empty()
+        },
+        MemKind::Upload => MemoryTypeFilter::PREFER_HOST | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+        MemKind::Readback => MemoryTypeFilter {
+            required_flags: F::HOST_VISIBLE,
+            preferred_flags: F::HOST_CACHED,
+            not_preferred_flags: F::DEVICE_LOCAL,
+        },
+    }
+}
+
+pub(crate) struct DeviceMapping {
+    buffer: DeviceBuffer,
+    write: bool,
+    ready: bool,
+}
+
+impl DeviceMapping {
+    pub(crate) fn ptr(&self) -> *mut u8 {
+        match &self.buffer.inner {
+            Some(inner) => unsafe {
+                inner
+                    .mapped_slice()
+                    .unwrap()
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(self.buffer.offset)
+            },
+            None => std::ptr::NonNull::<u64>::dangling().as_ptr().cast(),
+        }
+    }
+}
+
+impl Drop for DeviceMapping {
+    fn drop(&mut self) {
+        let mut access = self.buffer.access.lock();
+        if self.write {
+            if self.ready && self.buffer.cache_op(true).is_err() {
+                access.failed = true;
+            }
+            access.writer = false;
+        } else {
+            access.readers -= 1;
+        }
+    }
+}
+
+impl DeviceBuffer {
+    fn cache_op(&self, flush: bool) -> Result<()> {
+        let Some(inner) = &self.inner else {
+            return Ok(());
+        };
+        let BufferMemory::Normal(memory) = inner.buffer().memory() else {
+            unreachable!()
+        };
+        let Some(atom) = memory.atom_size() else {
+            return Ok(());
+        };
+        let end = aligned_ceil(
+            (inner.offset() + inner.size()) as usize,
+            atom.as_devicesize() as usize,
+        ) as u64;
+        let range = MappedMemoryRange {
+            offset: 0,
+            size: end.min(memory.size()),
+            ..Default::default()
+        };
+        // SAFETY: The whole allocation is reserved and its GPU accesses have completed.
+        unsafe {
+            if flush {
+                memory.flush_range(range)?;
+            } else {
+                memory.invalidate_range(range)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct DeviceBuffer {
     inner: Option<Subbuffer<[u8]>>,
@@ -988,6 +1111,8 @@ pub(super) struct DeviceBuffer {
     offset: usize,
     len: usize,
     epoch: Arc<AtomicU64>,
+    access: Arc<Mutex<CpuAccess>>,
+    kind: MemKind,
 }
 
 impl DeviceBuffer {
@@ -999,7 +1124,7 @@ impl DeviceBuffer {
         if let Some(inner) = self.inner.as_ref() {
             inner.mapped_slice().is_ok()
         } else {
-            false
+            self.kind != MemKind::Device
         }
     }
 }
@@ -1009,7 +1134,105 @@ impl DeviceEngineBuffer for DeviceBuffer {
     fn engine(&self) -> &Arc<Self::Engine> {
         &self.engine
     }
-    unsafe fn uninit(engine: Arc<Engine>, len: usize) -> Result<Self> {
+    fn kind(&self) -> MemKind {
+        self.kind
+    }
+    fn host_visible(&self) -> bool {
+        self.host_visible()
+    }
+    fn memory_properties(&self) -> Option<MemoryProperties> {
+        let inner = self.inner.as_ref()?;
+        let BufferMemory::Normal(memory) = inner.buffer().memory() else {
+            return None;
+        };
+        let index = memory.device_memory().memory_type_index() as usize;
+        let flags = self
+            .engine
+            .queue
+            .device()
+            .physical_device()
+            .memory_properties()
+            .memory_types[index]
+            .property_flags;
+        Some(MemoryProperties {
+            host_visible: flags.contains(MemoryPropertyFlags::HOST_VISIBLE),
+            device_local: flags.contains(MemoryPropertyFlags::DEVICE_LOCAL),
+            host_cached: flags.contains(MemoryPropertyFlags::HOST_CACHED),
+            host_coherent: flags.contains(MemoryPropertyFlags::HOST_COHERENT),
+        })
+    }
+    fn map(&self, write: bool, wait: bool) -> Result<DeviceMapping> {
+        if !self.host_visible() {
+            return Err(MapError::Unsupported.into());
+        }
+        let mut access = if wait {
+            self.access.lock()
+        } else {
+            self.access.try_lock().ok_or(MapError::Busy)?
+        };
+        if access.failed {
+            bail!("A mapped-memory cache operation failed.");
+        }
+        if access.writer || (write && access.readers != 0) {
+            return Err(MapError::Conflict.into());
+        }
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        if !wait {
+            match unsafe {
+                poll_semaphore(self.engine.queue.device(), &self.engine.semaphore, epoch)
+            } {
+                ash::vk::Result::SUCCESS => (),
+                ash::vk::Result::TIMEOUT => return Err(MapError::Busy.into()),
+                _ => return Err(DeviceLost(self.engine.id()).into()),
+            }
+        }
+        if write {
+            access.writer = true;
+        } else {
+            access.readers += 1;
+        }
+        drop(access);
+        let mut mapping = DeviceMapping {
+            buffer: self.clone(),
+            write,
+            ready: false,
+        };
+        self.engine.wait_epoch(epoch)?;
+        let _access = self.access.lock();
+        self.cache_op(false)?;
+        mapping.ready = true;
+        Ok(mapping)
+    }
+    fn copy(&self, dst: &Self) -> Result<()> {
+        if Arc::ptr_eq(&self.access, &dst.access) {
+            if self.offset == dst.offset {
+                return Ok(());
+            }
+            if self.offset < dst.offset + dst.len && dst.offset < self.offset + self.len {
+                bail!("Copy ranges overlap.");
+            }
+        }
+        if self.len == 0 {
+            return Ok(());
+        }
+        let src = self
+            .inner
+            .as_ref()
+            .unwrap()
+            .clone()
+            .slice(self.offset as u64..(self.offset + self.len) as u64);
+        let target = dst
+            .inner
+            .as_ref()
+            .unwrap()
+            .clone()
+            .slice(dst.offset as u64..(dst.offset + dst.len) as u64);
+        unsafe {
+            self.engine.transfer(src, target, None, &[self, dst])?;
+        }
+        Ok(())
+    }
+    unsafe fn uninit(engine: Arc<Engine>, len: usize, kind: MemKind) -> Result<Self> {
         use vulkano::{memory::allocator::MemoryAllocatorError, VulkanError};
         let inner = if len > 0 {
             let len = aligned_ceil(len, Self::ALIGN);
@@ -1021,7 +1244,7 @@ impl DeviceEngineBuffer for DeviceBuffer {
                 ..Default::default()
             };
             let allocation_info = AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                memory_type_filter: memory_filter(kind),
                 ..Default::default()
             };
             use vulkano::{
@@ -1069,6 +1292,8 @@ impl DeviceEngineBuffer for DeviceBuffer {
             offset: 0,
             len,
             epoch: Arc::new(AtomicU64::new(0)),
+            access: Arc::new(Mutex::new(CpuAccess::default())),
+            kind,
         })
     }
     fn upload(&self, data: &[u8]) -> Result<()> {
@@ -1086,8 +1311,10 @@ impl DeviceEngineBuffer for DeviceBuffer {
         let engine = &self.engine;
         let buffer_epoch = self.epoch.load(Ordering::SeqCst);
         if self.host_visible() {
-            engine.wait_epoch(buffer_epoch)?;
-            buffer.write().unwrap().copy_from_slice(data);
+            let mapping = self.map(true, true)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), mapping.ptr(), data.len());
+            }
             return Ok(());
         }
         let mut offset = 0;
@@ -1100,14 +1327,14 @@ impl DeviceEngineBuffer for DeviceBuffer {
             host_slice.write().unwrap().copy_from_slice(chunk);
             engine.wait_pending(buffer_epoch)?;
             unsafe {
-                engine.transfer(host_slice, buffer_slice, &mut host_buffer, Some(self))?;
+                engine.transfer(host_slice, buffer_slice, Some(&mut host_buffer), &[self])?;
             }
             engine.host_buffer_sender.send(host_buffer).unwrap();
             offset += size;
         }
         Ok(())
     }
-    fn download(&self, data: &mut [u8]) -> Result<()> {
+    fn download(&self, data: &mut [MaybeUninit<u8>]) -> Result<()> {
         debug_assert_eq!(data.len(), self.len);
         if self.len == 0 {
             return Ok(());
@@ -1122,28 +1349,56 @@ impl DeviceEngineBuffer for DeviceBuffer {
         let engine = &self.engine;
         let buffer_epoch = self.epoch.load(Ordering::SeqCst);
         if self.host_visible() {
-            engine.wait_epoch(buffer_epoch)?;
-            data.copy_from_slice(&buffer.read().unwrap());
+            let mapping = self.map(false, true)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(mapping.ptr(), data.as_mut_ptr().cast(), data.len());
+            }
             return Ok(());
         }
         struct HostCopy<'a> {
-            chunk: &'a mut [u8],
+            chunk: &'a mut [MaybeUninit<u8>],
             host_buffer: HostBuffer,
             host_slice: Subbuffer<[u8]>,
+        }
+        impl HostCopy<'_> {
+            fn finish(self, engine: &Engine) -> Result<HostBuffer> {
+                engine.wait_epoch(self.host_buffer.epoch)?;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        self.host_slice.read().unwrap().as_ptr(),
+                        self.chunk.as_mut_ptr().cast(),
+                        self.chunk.len(),
+                    );
+                }
+                Ok(self.host_buffer)
+            }
         }
         let mut host_copy: Option<HostCopy> = None;
         let mut offset = 0;
         for chunk in data.chunks_mut(Self::HOST_BUFFER_SIZE).chain([[].as_mut()]) {
-            let prev_host_copy = host_copy.take();
+            let mut prev_host_copy = host_copy.take();
             if !chunk.is_empty() {
-                let mut host_buffer = engine.host_buffer()?;
+                // Reuse the held buffer if the pool is empty. Waiting for a second
+                // buffer can deadlock with another download that holds the first.
+                let mut host_buffer = match engine.host_buffer_receiver.try_recv() {
+                    Ok(buffer) => buffer,
+                    Err(_) => match prev_host_copy.take() {
+                        Some(copy) => copy.finish(engine)?,
+                        None => engine.host_buffer()?,
+                    },
+                };
                 engine.wait_epoch(host_buffer.epoch)?;
                 let size = chunk.len() as u64;
                 let buffer_slice = buffer.clone().slice(offset..offset + size);
                 let host_slice = host_buffer.inner.clone().slice(0..size);
                 engine.wait_pending(buffer_epoch)?;
                 unsafe {
-                    engine.transfer(buffer_slice, host_slice.clone(), &mut host_buffer, None)?;
+                    engine.transfer(
+                        buffer_slice,
+                        host_slice.clone(),
+                        Some(&mut host_buffer),
+                        &[self],
+                    )?;
                 }
                 host_copy.replace(HostCopy {
                     chunk,
@@ -1153,14 +1408,10 @@ impl DeviceEngineBuffer for DeviceBuffer {
                 offset += size;
             }
             if let Some(prev_host_copy) = prev_host_copy {
-                let HostCopy {
-                    chunk,
-                    host_buffer,
-                    host_slice,
-                } = prev_host_copy;
-                engine.wait_epoch(host_buffer.epoch)?;
-                chunk.copy_from_slice(&host_slice.read().unwrap());
-                engine.host_buffer_sender.send(host_buffer).unwrap();
+                engine
+                    .host_buffer_sender
+                    .send(prev_host_copy.finish(engine)?)
+                    .unwrap();
             }
         }
         Ok(())
@@ -1187,81 +1438,61 @@ impl DeviceEngineBuffer for DeviceBuffer {
         let engine2 = &dst.engine;
         let buffer2_epoch = dst.epoch.load(Ordering::SeqCst);
         if self.host_visible() && dst.host_visible() {
-            engine1.wait_epoch(buffer1_epoch)?;
-            engine2.wait_epoch(buffer2_epoch)?;
-            buffer2
-                .write()
-                .unwrap()
-                .copy_from_slice(&buffer1.read().unwrap());
+            let src = self.map(false, true)?;
+            let dst = dst.map(true, true)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.ptr(), dst.ptr(), self.len);
+            }
             return Ok(());
         } else if self.host_visible() {
-            engine1.wait_epoch(buffer1_epoch)?;
-            return dst.upload(&buffer1.read().unwrap());
+            let src = self.map(false, true)?;
+            return dst.upload(unsafe { std::slice::from_raw_parts(src.ptr(), self.len) });
         } else if dst.host_visible() {
-            engine2.wait_epoch(buffer2_epoch)?;
-            return self.download(&mut buffer2.write().unwrap());
+            let target = dst.map(true, true)?;
+            return self
+                .download(unsafe { std::slice::from_raw_parts_mut(target.ptr().cast(), dst.len) });
         }
-        struct HostCopy {
-            host_buffer1: HostBuffer,
-            host_slice1: Subbuffer<[u8]>,
-            buffer_slice2: Subbuffer<[u8]>,
-        }
-        let mut host_copy: Option<HostCopy> = None;
+        // Acquire staging buffers in device order, including reverse transfers.
+        let (mut host_buffer1, mut host_buffer2) = if Arc::as_ptr(engine1) < Arc::as_ptr(engine2) {
+            (engine1.host_buffer()?, engine2.host_buffer()?)
+        } else {
+            let buffer2 = engine2.host_buffer()?;
+            (engine1.host_buffer()?, buffer2)
+        };
         let mut offset = 0;
-        loop {
-            let size = buffer1
-                .size()
-                .checked_sub(offset)
-                .unwrap_or_default()
-                .min(Self::HOST_BUFFER_SIZE as u64);
-            let prev_host_copy = host_copy.take();
-            if size > 0 {
-                let mut host_buffer1 = engine1.host_buffer()?;
-                let buffer_slice1 = buffer1.clone().slice(offset..offset + size);
-                let host_slice1 = host_buffer1.inner.clone().slice(0..size);
-                engine1.wait_epoch(host_buffer1.epoch)?;
-                engine1.wait_pending(buffer1_epoch)?;
-                unsafe {
-                    engine1.transfer(
-                        buffer_slice1,
-                        host_slice1.clone(),
-                        &mut host_buffer1,
-                        None,
-                    )?;
-                }
-                let buffer_slice2 = buffer2.clone().slice(offset..offset + size);
-                host_copy.replace(HostCopy {
-                    host_buffer1,
-                    host_slice1,
-                    buffer_slice2,
-                });
-                offset += size;
+        while offset < buffer1.size() {
+            let size = (buffer1.size() - offset).min(Self::HOST_BUFFER_SIZE as u64);
+            let host_slice1 = host_buffer1.inner.clone().slice(0..size);
+            let host_slice2 = host_buffer2.inner.clone().slice(0..size);
+            engine1.wait_epoch(host_buffer1.epoch)?;
+            engine1.wait_pending(buffer1_epoch)?;
+            unsafe {
+                engine1.transfer(
+                    buffer1.clone().slice(offset..offset + size),
+                    host_slice1.clone(),
+                    Some(&mut host_buffer1),
+                    &[self],
+                )?;
             }
-            if let Some(prev_host_copy) = prev_host_copy {
-                let HostCopy {
-                    host_buffer1,
-                    host_slice1,
-                    buffer_slice2,
-                } = prev_host_copy;
-                let size = buffer_slice2.size();
-                let mut host_buffer2 = engine2.host_buffer()?;
-                let host_slice2 = host_buffer2.inner.clone().slice(0..size);
-                engine1.wait_epoch(host_buffer1.epoch)?;
-                engine2.wait_epoch(host_buffer2.epoch)?;
-                host_slice2
-                    .write()
-                    .unwrap()
-                    .copy_from_slice(&host_slice1.read().unwrap());
-                engine1.host_buffer_sender.send(host_buffer1).unwrap();
-                engine2.wait_pending(buffer2_epoch)?;
-                unsafe {
-                    engine2.transfer(host_slice2, buffer_slice2, &mut host_buffer2, Some(dst))?;
-                }
-                engine2.host_buffer_sender.send(host_buffer2).unwrap();
-            } else if size == 0 {
-                break;
+            engine1.wait_epoch(host_buffer1.epoch)?;
+            engine2.wait_epoch(host_buffer2.epoch)?;
+            host_slice2
+                .write()
+                .unwrap()
+                .copy_from_slice(&host_slice1.read().unwrap());
+            engine2.wait_pending(buffer2_epoch)?;
+            unsafe {
+                engine2.transfer(
+                    host_slice2,
+                    buffer2.clone().slice(offset..offset + size),
+                    Some(&mut host_buffer2),
+                    &[dst],
+                )?;
             }
+            offset += size;
         }
+        engine1.host_buffer_sender.send(host_buffer1).unwrap();
+        engine2.host_buffer_sender.send(host_buffer2).unwrap();
         Ok(())
     }
     fn offset(&self) -> usize {

@@ -1,10 +1,13 @@
 use dry::macro_for;
 use half::{bf16, f16};
-#[cfg(feature = "device")]
-use krnl::buffer::Buffer;
-use krnl::{buffer::Slice, device::Device, scalar::Scalar};
+use krnl::buffer::{Buffer, MapError, SliceMut};
 #[cfg(not(target_family = "wasm"))]
-use krnl::{device::Features, scalar::ScalarType};
+use krnl::{buffer::ArcBuffer, device::Features, scalar::ScalarType};
+use krnl::{
+    buffer::{Mem, Slice},
+    device::Device,
+    scalar::Scalar,
+};
 #[cfg(not(target_family = "wasm"))]
 use libtest_mimic::{Arguments, Trial};
 use paste::paste;
@@ -83,6 +86,24 @@ fn buffer_tests(device: &Device, device2: Option<&Device>) -> impl IntoIterator<
     let mut tests = Vec::new();
 
     tests.push(device_test(device, "buffer_from_vec", buffer_from_vec));
+    tests.push(device_test(device, "buffer_placement", buffer_placement));
+    tests.push(device_test(
+        device,
+        "buffer_placement_errors",
+        buffer_placement_errors,
+    ));
+    if device.is_device() {
+        tests.push(device_test(
+            device,
+            "buffer_mapping_conflicts",
+            buffer_mapping_conflicts,
+        ));
+        tests.push(device_test(
+            device,
+            "buffer_concurrent_downloads",
+            buffer_concurrent_downloads,
+        ));
+    }
 
     if device.is_device() {
         #[cfg(feature = "device")]
@@ -161,6 +182,14 @@ fn buffer_tests(device: &Device, device2: Option<&Device>) -> impl IntoIterator<
     tests
 }
 
+fn test_mem(device: &Device) -> Mem<'_> {
+    if device.is_host() {
+        Mem::Host
+    } else {
+        Mem::Device(device)
+    }
+}
+
 fn buffer_test_lengths() -> impl ExactSizeIterator<Item = usize> {
     [0, 1, 3, 4, 16, 67, 157].into_iter()
 }
@@ -181,9 +210,9 @@ fn buffer_from_vec(device: Device) {
     for n in buffer_transfer_test_lengths() {
         let x = &x[..n];
         let y = Slice::from(x)
-            .to_device(device.clone())
+            .to_owned(test_mem(&device))
             .unwrap()
-            .into_vec()
+            .into_host_vec()
             .unwrap();
         assert_eq!(y.len(), n);
         if x != y.as_slice() {
@@ -197,9 +226,11 @@ fn buffer_from_vec(device: Device) {
 #[cfg(feature = "device")]
 fn device_buffer_too_large(device: Device) {
     use krnl::buffer::error::DeviceBufferTooLarge;
-    let error = unsafe { Buffer::<u32>::uninit(device, (i32::MAX / 4 + 1).try_into().unwrap()) }
-        .err()
-        .unwrap();
+    let error = unsafe {
+        Buffer::<u32>::uninit(Mem::Device(&device), (i32::MAX / 4 + 1).try_into().unwrap())
+    }
+    .err()
+    .unwrap();
     error.downcast_ref::<DeviceBufferTooLarge>().unwrap();
 }
 
@@ -210,11 +241,11 @@ fn buffer_transfer(device: Device, device2: Device) {
     for n in buffer_transfer_test_lengths() {
         let x = &x[..n];
         let y = Slice::from(x)
-            .to_device(device.clone())
+            .to_owned(test_mem(&device))
             .unwrap()
-            .to_device(device2.clone())
+            .to_owned(test_mem(&device2))
             .unwrap()
-            .into_vec()
+            .into_host_vec()
             .unwrap();
         if x != y.as_slice() {
             for (i, (x, y)) in x.iter().zip(y).enumerate() {
@@ -234,9 +265,9 @@ fn buffer_fill<T: Scalar>(device: Device) {
         .collect::<Vec<_>>();
     for n in buffer_test_lengths() {
         let x = &x[..n];
-        let mut y = Slice::from(x).to_device(device.clone()).unwrap();
+        let mut y = Slice::from(x).to_owned(test_mem(&device)).unwrap();
         y.fill(elem).unwrap();
-        let y: Vec<T> = y.into_vec().unwrap();
+        let y: Vec<T> = y.into_host_vec().unwrap();
         for (i, y) in y.into_iter().enumerate() {
             assert_eq!(y, elem, "i: {i}, n: {n}");
         }
@@ -253,11 +284,11 @@ fn buffer_cast<X: Scalar, Y: Scalar>(device: Device) {
     for n in buffer_test_lengths() {
         let x = &x[..n];
         let y = Slice::<X>::from(x)
-            .into_device(device.clone())
+            .into_owned(test_mem(&device))
             .unwrap()
-            .cast_into::<Y>()
+            .cast_into::<Y>(test_mem(&device))
             .unwrap()
-            .into_vec()
+            .into_host_vec()
             .unwrap();
         for (i, (x, y)) in x.iter().zip(y.iter()).enumerate() {
             assert_eq!(*y, x.cast::<Y>(), "i: {i}, n: {n}");
@@ -268,7 +299,7 @@ fn buffer_cast<X: Scalar, Y: Scalar>(device: Device) {
 fn buffer_bitcast<X: Scalar, Y: Scalar>(device: Device) {
     let x_host = vec![0u64; 16];
     let x_host: &[X] = &bytemuck::cast_slice(&x_host)[..16];
-    let x = Slice::from(x_host).to_device(device).unwrap();
+    let x = Slice::from(x_host).to_owned(test_mem(&device)).unwrap();
     for i in 0..=16 {
         for range in [i..16, 0..i] {
             let bytemuck_result =
@@ -280,6 +311,185 @@ fn buffer_bitcast<X: Scalar, Y: Scalar>(device: Device) {
             assert_eq!(result, bytemuck_result);
         }
     }
+}
+
+fn mapped_placements(device: &Device) -> Vec<Mem<'_>> {
+    if device.is_host() {
+        vec![Mem::Host]
+    } else {
+        vec![
+            Mem::Shared(device),
+            Mem::Upload(device),
+            Mem::Readback(device),
+        ]
+    }
+}
+
+fn buffer_placement(device: Device) {
+    for mem in mapped_placements(&device) {
+        // Empty, single-element, odd, and 256-byte allocation boundaries.
+        for len in [0, 1, 3, 256 / std::mem::size_of::<u32>()] {
+            let mut next = 0;
+            let mut x = Buffer::allocate_with(mem, len, |i| {
+                assert_eq!(i, next);
+                next += 1;
+                i as u32
+            })
+            .unwrap();
+            assert_eq!(next, len);
+            assert!(x.is_host_visible());
+            if len != 0 && device.is_device() {
+                assert!(x.memory_properties().unwrap().host_visible);
+            }
+            assert_eq!(
+                &*x.map_read().unwrap(),
+                &(0..len as u32).collect::<Vec<_>>()
+            );
+            x.try_map_write().unwrap().fill(1);
+            assert_eq!(&*x.try_map_read().unwrap(), &vec![1; len]);
+            if len > 1 {
+                let mut tail = x.slice_mut(1..).unwrap();
+                tail.map_write().unwrap().fill(2);
+                let bytes = tail.bitcast::<u8>().unwrap();
+                assert_eq!(
+                    &*bytes.map_read().unwrap(),
+                    bytemuck::cast_slice::<_, u8>(&vec![2u32; len - 1])
+                );
+            }
+            let y = x.to_owned(test_mem(&device)).unwrap();
+            if !y.is_host_visible() {
+                assert_eq!(
+                    y.try_map_read().err().unwrap().downcast_ref::<MapError>(),
+                    Some(&MapError::Unsupported)
+                );
+            }
+            let mut output = vec![0; len];
+            SliceMut::from(output.as_mut_slice())
+                .copy_from_slice(&y.as_slice())
+                .unwrap();
+            assert_eq!(output, x.to_host_vec().unwrap());
+            #[cfg(feature = "serde")]
+            assert_eq!(
+                serde_json::to_string(&x).unwrap(),
+                serde_json::to_string(&Buffer::from_host_vec(output.clone())).unwrap()
+            );
+            // Both casts dispatch kernels on a GPU. The intermediate stays on that GPU.
+            let y = x.cast::<f32>(mem).unwrap().cast::<u32>(mem).unwrap();
+            assert_eq!(&*y.map_read().unwrap(), output.as_slice());
+            x.fill(3).unwrap();
+            match x.try_map_read() {
+                Ok(read) => assert_eq!(&*read, &vec![3; len]),
+                Err(error) => assert_eq!(error.downcast_ref::<MapError>(), Some(&MapError::Busy)),
+            }
+            assert_eq!(&*x.map_read().unwrap(), &vec![3; len]);
+        }
+        // Copies accept byte offsets and lengths without integer shader features.
+        let x = Buffer::allocate_with(mem, 4, |i| i as u8).unwrap();
+        let y = x.slice(1..).unwrap().to_owned(mem).unwrap();
+        assert_eq!(&*y.map_read().unwrap(), &[1, 2, 3]);
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn buffer_placement_errors(device: Device) {
+    let host = Device::host();
+    for mem in [
+        Mem::Device(&host),
+        Mem::Shared(&host),
+        Mem::Upload(&host),
+        Mem::Readback(&host),
+    ] {
+        assert!(Buffer::<u32>::zeros(mem, 0).is_err());
+    }
+    assert!(Buffer::<u32>::allocate_with(Mem::Device(&device), 0, |_| unreachable!()).is_err());
+    assert!(Buffer::<u64>::allocate_with(Mem::Host, usize::MAX, |_| unreachable!()).is_err());
+    for mem in mapped_placements(&device) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Buffer::allocate_with(mem, 2, |i| {
+                assert_eq!(i, 0, "initializer panic after one write");
+                i as u32
+            })
+            .unwrap()
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            &*Buffer::<u32>::zeros(mem, 2).unwrap().map_read().unwrap(),
+            &[0, 0]
+        );
+        let mut original: ArcBuffer<_> = Buffer::<u32>::ones(mem, 2).unwrap().into();
+        let alias = original.clone();
+        original
+            .make_slice_mut(Mem::Host)
+            .unwrap()
+            .map_write()
+            .unwrap()
+            .fill(0);
+        assert!(original.device().is_host());
+        assert_eq!(&*alias.map_read().unwrap(), &[1, 1]);
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn buffer_concurrent_downloads(device: Device) {
+    use std::{
+        sync::{mpsc, Arc, Barrier},
+        time::Duration,
+    };
+    // Exceed the 32 MB staging buffer so each download needs two chunks.
+    const LEN: usize = 32_000_000 / std::mem::size_of::<u32>() + 1;
+    let input: ArcBuffer<u32> = Buffer::ones(Mem::Device(&device), LEN).unwrap().into();
+    let start = Arc::new(Barrier::new(2));
+    let (sender, done) = mpsc::channel();
+    for _ in 0..2 {
+        let (input, start, sender) = (input.clone(), start.clone(), sender.clone());
+        std::thread::spawn(move || {
+            start.wait();
+            let output = input.to_host_vec().unwrap();
+            assert_eq!(output.len(), LEN);
+            assert!(output.iter().all(|&x| x == 1));
+            sender.send(()).unwrap();
+        });
+    }
+    for _ in 0..2 {
+        done.recv_timeout(Duration::from_secs(30))
+            .expect("concurrent downloads must complete");
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn buffer_mapping_conflicts(device: Device) {
+    let mut x = Buffer::<u32>::ones(Mem::Shared(&device), 2).unwrap();
+    let shared: ArcBuffer<_> = x.to_owned(Mem::Shared(&device)).unwrap().into();
+    let alias = shared.clone();
+    let view = shared.slice(1..).unwrap();
+    let bytes = view.bitcast::<u8>().unwrap();
+    let read = bytes.map_read().unwrap();
+    let other_read = alias.map_read().unwrap();
+    for error in [
+        alias.to_owned(Mem::Device(&device)).err().unwrap(),
+        alias.cast::<f32>(Mem::Shared(&device)).err().unwrap(),
+    ] {
+        assert_eq!(error.downcast_ref::<MapError>(), Some(&MapError::Conflict));
+    }
+    drop((read, other_read));
+    x.copy_from_slice(&alias.as_slice()).unwrap();
+    assert_eq!(&*x.map_read().unwrap(), &[1, 1]);
+    // A forgotten guard must keep its access reservation.
+    std::mem::forget(x.map_write().unwrap());
+    assert_eq!(
+        x.map_read().err().unwrap().downcast_ref::<MapError>(),
+        Some(&MapError::Conflict)
+    );
+    assert_eq!(
+        x.fill(0).err().unwrap().downcast_ref::<MapError>(),
+        Some(&MapError::Conflict)
+    );
+}
+
+#[cfg(target_family = "wasm")]
+#[test]
+fn buffer_placement_host() {
+    buffer_placement(Device::host());
 }
 
 #[test]
