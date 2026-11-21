@@ -56,8 +56,16 @@ On ARM64 macOS, this branch links
 Vulkan-to-Metal adapter. It requires macOS 26 or later and a Metal 4 GPU.
 No Vulkan loader or system driver installation is needed.
 
-To build the driver, install Xcode with the macOS 26 SDK. Select it with
-`xcode-select` if necessary. Install the remaining build tools:
+The default build downloads a prebuilt driver and checks its SHA-256 checksum.
+Run the macOS device tests with:
+
+```sh
+cargo test -p krnl --features serde --lib --test integration_tests -- --test-threads=1
+```
+
+To build the driver from source, enable `kosmickrisp-static/build-kosmickrisp`.
+Install Xcode with the macOS 26 SDK and select it with `xcode-select` if necessary.
+Install the remaining build tools:
 
 ```sh
 brew install cmake ninja pkgconf llvm spirv-llvm-translator python@3.13
@@ -68,13 +76,7 @@ export PATH="$(brew --prefix llvm)/bin:$PATH"
 export PKG_CONFIG_PATH="$(brew --prefix spirv-llvm-translator)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 ```
 
-Run the macOS device tests with a source build of the driver:
-
-```sh
-cargo test -p krnl --features serde,kosmickrisp-static/build-kosmickrisp --lib --test integration_tests -- --test-threads=1
-```
-
-Without `kosmickrisp-static/build-kosmickrisp`, supply an archive as described in
+To supply an archive from a local directory or another URL, see
 the [driver README](https://github.com/jlogan03/kosmickrisp-static#package-an-archive).
 CI builds the macOS tests. Running them requires a Metal 4 GPU, which GitHub's
 hosted runners do not expose.
