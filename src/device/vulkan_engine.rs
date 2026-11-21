@@ -53,17 +53,17 @@ use vulkano::{
 };
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-struct MoltenVkLoader;
+struct KosmicKrispLoader;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-// MoltenVK is linked for the process lifetime and provides the Vulkan C ABI.
-unsafe impl vulkano::library::Loader for MoltenVkLoader {
+// KosmicKrisp is linked for the process lifetime and provides the Vulkan C ABI.
+unsafe impl vulkano::library::Loader for KosmicKrispLoader {
     unsafe fn get_instance_proc_addr(
         &self,
         instance: ash::vk::Instance,
         name: *const std::ffi::c_char,
     ) -> ash::vk::PFN_vkVoidFunction {
-        unsafe { moltenvk_static::vkGetInstanceProcAddr(instance.as_raw() as *mut _, name) }
+        unsafe { kosmickrisp_static::get_instance_proc_addr(instance.as_raw() as *mut _, name) }
     }
 }
 
@@ -179,7 +179,7 @@ impl DeviceEngine for Engine {
             optimal_features,
         } = options;
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let library = VulkanLibrary::with_loader(MoltenVkLoader);
+        let library = VulkanLibrary::with_loader(KosmicKrispLoader);
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         let library = VulkanLibrary::new();
         let library = library.map_err(|e| Error::new(DeviceUnavailable).context(e))?;

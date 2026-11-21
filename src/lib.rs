@@ -4,7 +4,7 @@ Safe, portable, high performance compute (GPGPU) kernels.
 Developed for [autograph](https://docs.rs/autograph).
 - Similar functionality to CUDA and OpenCL.
 - Supports GPU's and other Vulkan 1.2 capable devices.
-- MacOS / iOS supported via [MoltenVK](https://github.com/KhronosGroup/MoltenVK).
+- ARM64 macOS support via [KosmicKrisp](https://www.lunarg.com/products/kosmickrisp/).
 - Kernels are written inline, entirely in Rust.
     - Simple iterator patterns can be implemented without unsafe.
     - Supports inline [SPIR-V](https://www.khronos.org/spir) assembly.
@@ -21,7 +21,9 @@ Kernel compiler for krnl.
 See [kernel](kernel#krnlc) for installation and usage instructions.
 
 # Installing
-For device functionality (kernels), install [Vulkan](https://www.vulkan.org) for your platform.
+For device functionality (kernels), install [Vulkan](https://www.vulkan.org) for your platform, except on ARM64 macOS.
+ARM64 macOS uses statically linked KosmicKrisp and requires macOS 26 or later with a Metal 4 GPU.
+See the repository README for driver build instructions.
 - For development, it's recomended to install the [LunarG Vulkan SDK](https://www.lunarg.com/vulkan-sdk/), which includes additional tools:
     - vulkaninfo
     - Validation layers

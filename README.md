@@ -12,7 +12,7 @@ Developed for [autograph](https://github.com/charles-r-earp/autograph).
 
 - Similar functionality to CUDA and OpenCL.
 - Supports GPU's and other Vulkan 1.2 capable devices.
-- MacOS / iOS supported via [MoltenVK](https://github.com/KhronosGroup/MoltenVK).
+- ARM64 macOS support via [KosmicKrisp](https://www.lunarg.com/products/kosmickrisp/).
 - Kernels are written inline, entirely in Rust.
   - Simple iterator patterns can be implemented without unsafe.
   - Supports inline [SPIR-V](https://www.khronos.org/spir) assembly.
@@ -51,17 +51,33 @@ SPIRV-Tools from `PATH`.
 For device functionality (kernels), install [Vulkan](https://www.vulkan.org) for your
 platform, except on ARM64 macOS.
 
-On ARM64 macOS 12 or later, krnl links MoltenVK statically via
-`moltenvk-static` as a Vulkan-to-Metal adapter.
+On ARM64 macOS, this branch links
+[`kosmickrisp-static`](https://github.com/jlogan03/kosmickrisp-static) as a
+Vulkan-to-Metal adapter. It requires macOS 26 or later and a Metal 4 GPU.
+No Vulkan loader or system driver installation is needed.
 
-Plan to replace MoltenVK with [KosmicKrisp](https://www.lunarg.com/products/kosmickrisp/)
-once its runtime is easier for users to install. This would require macOS 26 or later.
-
-Run the macOS device tests from this checkout with:
+To build the driver, install Xcode with the macOS 26 SDK. Select it with
+`xcode-select` if necessary. Install the remaining build tools:
 
 ```sh
-cargo test -p krnl --features moltenvk-static/build-moltenvk --lib --test integration_tests -- --test-threads=1
+brew install cmake ninja pkgconf llvm spirv-llvm-translator python@3.13
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install meson==1.9.1 mako packaging pyyaml
+export PATH="$(brew --prefix llvm)/bin:$PATH"
+export PKG_CONFIG_PATH="$(brew --prefix spirv-llvm-translator)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 ```
+
+Run the macOS device tests with a source build of the driver:
+
+```sh
+cargo test -p krnl --features serde,kosmickrisp-static/build-kosmickrisp --lib --test integration_tests -- --test-threads=1
+```
+
+Without `kosmickrisp-static/build-kosmickrisp`, supply an archive as described in
+the [driver README](https://github.com/jlogan03/kosmickrisp-static#package-an-archive).
+CI builds the macOS tests. Running them requires a Metal 4 GPU, which GitHub's
+hosted runners do not expose.
 
 Kernels compile with rust-gpu's `rust_math` policy. Ordinary arithmetic preserves
 signed zero, NaN, and infinity and disables reassociation and implicit FMA

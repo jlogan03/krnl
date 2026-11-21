@@ -86,7 +86,7 @@ ash = { version = "0.38", optional = true }
 crossbeam-channel = { version = "0.5.8", optional = true }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-moltenvk-static = { git = "https://github.com/jlogan03/moltenvk-static", rev = "40ef04ca8647a3584bf3b484e90e906308647ceb", optional = true }
+kosmickrisp-static = { git = "https://github.com/jlogan03/kosmickrisp-static", rev = "2435236d1e1dafa63a400b3bec68f1e8d5de79d6", optional = true }
 
 [features]
 default = ["device"]
@@ -98,7 +98,7 @@ device = [
     "dep:rspirv",
     "dep:fxhash",
     "dep:crossbeam-channel",
-    "dep:moltenvk-static",
+    "dep:kosmickrisp-static",
 ]
 serde = ["dep:serde", "dep:serde_bytes", "krnl-core/serde"]
 
